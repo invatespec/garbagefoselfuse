@@ -1299,7 +1299,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                     .cpu()
                     .numpy()[0, 0]
                 )
-                return audio, hps.data.sampling_rate, zero_wav.cpu().numpy()
+                return audio, hps.data.sampling_rate, zero_wav
             else:
                 # v3/v4 版本
                 phoneme_ids0 = torch.LongTensor(phones1).to(target_gpu).unsqueeze(0)
@@ -1391,7 +1391,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                     
                     # 9. 返回音频数据
                     # 注意：这里需要将zero_wav作为numpy数组返回，用于片段间的连接
-                    return audio, hps.data.sampling_rate, zero_wav.cpu().numpy()
+                    return audio, hps.data.sampling_rate, zero_wav
         
     except Exception as e:
         logger.error(f"❌ GPU{gpu_index} 处理失败: {e}")
@@ -1917,4 +1917,5 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
+
         print("\n👋 接收到中断信号，正在关闭...")
