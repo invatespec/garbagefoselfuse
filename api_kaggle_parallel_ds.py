@@ -508,7 +508,9 @@ def get_gpt_weights(gpt_path, target_gpu="cuda:0"):
     dict_s1 = torch.load(gpt_path, map_location="cpu", weights_only=False)
     config = dict_s1["config"]
     max_sec = config["data"]["max_sec"]
-    t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
+    t2s_model = _safe_model_load(
+     lambda: Text2SemanticLightningModule(config, "****", is_train=False)
+    )
     t2s_model.load_state_dict(dict_s1["weight"])
     if is_half == True:
         t2s_model = t2s_model.half()
@@ -924,37 +926,71 @@ def ensure_model_loaded(speaker_id, gpu_index=None):
     
     # 如果指定了GPU索引
     if gpu_index is not None:
+        # 检查GPU是否可用
+        if gpu_index >= torch.cuda.device_count():
+            raise ValueError(f"GPU {gpu_index} 不可用，可用GPU数量: {torch.cuda.device_count()}")
+        
         target_gpu = f"cuda:{gpu_index}"
         
         # 检查该GPU上的模型是否已加载
         if gpu_index == 0:
             if speaker.gpu0_gpt is None:
+                # 检查内存是否充足
+                free_mem, total_mem = check_gpu_memory(gpu_index)
+                if free_mem < 1.0:  # 少于1GB空闲内存
+                    logger.warning(f"GPU{gpu_index} 内存不足 ({free_mem:.2f}GB)，尝试清理...")
+                    torch.cuda.empty_cache()
+                    free_mem, _ = check_gpu_memory(gpu_index)
+                    if free_mem < 0.5:  # 清理后仍少于500MB
+                        # 卸载最久未使用的模型
+                        unload_least_recently_used()
+                
                 # 检查是否需要卸载旧模型
                 if loaded_models_count >= max_models * 2:
                     unload_least_recently_used()
                 
                 # 加载模型
+                logger.info(f"正在加载模型到 GPU{gpu_index}...")
                 speaker.gpu0_gpt = get_gpt_weights(speaker.gpt_path, target_gpu)
                 speaker.gpu0_sovits = get_sovits_weights(speaker.sovits_path, target_gpu)
                 loaded_models_count += 1
+                logger.info(f"✅ 模型已加载到 GPU{gpu_index}")
         
         elif gpu_index == 1:
             if speaker.gpu1_gpt is None:
+                # 检查内存是否充足
+                free_mem, total_mem = check_gpu_memory(gpu_index)
+                if free_mem < 1.0:  # 少于1GB空闲内存
+                    logger.warning(f"GPU{gpu_index} 内存不足 ({free_mem:.2f}GB)，尝试清理...")
+                    torch.cuda.empty_cache()
+                    free_mem, _ = check_gpu_memory(gpu_index)
+                    if free_mem < 0.5:  # 清理后仍少于500MB
+                        # 卸载最久未使用的模型
+                        unload_least_recently_used()
+                
                 # 检查是否需要卸载旧模型
                 if loaded_models_count >= max_models * 2:
                     unload_least_recently_used()
                 
                 # 加载模型
+                logger.info(f"正在加载模型到 GPU{gpu_index}...")
                 speaker.gpu1_gpt = get_gpt_weights(speaker.gpt_path, target_gpu)
                 speaker.gpu1_sovits = get_sovits_weights(speaker.sovits_path, target_gpu)
                 loaded_models_count += 1
+                logger.info(f"✅ 模型已加载到 GPU{gpu_index}")
     
     # 如果未指定GPU，确保至少一个GPU有模型
     else:
         if speaker.gpu0_gpt is None and speaker.gpu1_gpt is None:
-            import random
-            selected_gpu = random.choice([0, 1])
+            # 选择内存更充足的GPU
+            free_mem_0, _ = check_gpu_memory(0)
+            free_mem_1, _ = check_gpu_memory(1)
+            
+            selected_gpu = 0 if free_mem_0 >= free_mem_1 else 1
+            logger.info(f"自动选择 GPU{selected_gpu} (空闲内存: {max(free_mem_0, free_mem_1):.2f}GB)")
+            
             ensure_model_loaded(speaker_id, selected_gpu)
+
 # 修改 get_tts_wav 函数，正确处理 get_spepc 的返回值
 def get_tts_wav(
     refer_wav_path,
@@ -979,23 +1015,26 @@ def get_tts_wav(
     # 1. 智能文本拆分
     is_long, text_segments = split_long_text(text, LONG_TEXT_THRESHOLD)
     
-    # 更新模型访问时间 - 修正访问方式
+    # 更新模型访问时间
     if spk in speaker_list:
-        speaker_list[spk].last_used = ttime()  # 使用点号访问属性
+        speaker_list[spk].last_used = ttime()
     
-    # 2. 音频合并缓冲区
-    all_audio_bytes = BytesIO()
-    zero_wav = None
+    # 2. 获取说话人信息
+    if spk not in speaker_list:
+        raise ValueError(f"Speaker {spk} not found")
     
+    speaker = speaker_list[spk]
+    
+    # 3. 根据是否长文本选择处理方式
     if is_long:
         # ============ 长文本并行处理 ============
         logger.info(f"📖 长文本检测 ({len(text)}字 > {LONG_TEXT_THRESHOLD})，启用双GPU并行处理")
         
-        # 2.1 确保两个GPU上都有模型
+        # 3.1 确保两个GPU上都有模型
         ensure_model_loaded(spk, 0)
         ensure_model_loaded(spk, 1)
         
-        # 2.2 并行处理两个文本片段
+        # 3.2 并行处理两个文本片段
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             # 准备两个任务
             futures = []
@@ -1026,12 +1065,13 @@ def get_tts_wav(
                 )
                 futures.append((i, future))
             
-            # 2.3 收集结果并保持顺序
+            # 3.3 收集结果并保持顺序
             segment_results = []
             for seg_idx, future in sorted(futures, key=lambda x: x[0]):
                 try:
-                    audio_data, sr, segment_zero_wav = future.result(timeout=120)  # 120秒超时
-                    segment_results.append((seg_idx, audio_data, sr, segment_zero_wav))
+                    # 获取音频数据：audio_array, sample_rate
+                    audio_data, sr = future.result(timeout=120)  # 120秒超时
+                    segment_results.append((seg_idx, audio_data, sr))
                 except concurrent.futures.TimeoutError:
                     logger.error(f"❌ 片段 {seg_idx} 处理超时")
                     raise
@@ -1039,69 +1079,64 @@ def get_tts_wav(
                     logger.error(f"❌ 片段 {seg_idx} 处理失败: {e}")
                     raise
         
-        # 2.4 合并音频片段
+        # 3.4 合并音频片段
         if not segment_results:
             raise ValueError("没有有效的音频片段生成")
             
         # 按原始顺序排序
         segment_results.sort(key=lambda x: x[0])
         
-        # 获取采样率（应该相同）
-        final_sr = segment_results[0][2]
+        # 获取第一个片段的采样率作为参考
+        first_audio, first_sr = segment_results[0][1], segment_results[0][2]
         
         # 合并所有音频片段
         all_audio_segments = []
-        for i, (_, audio_data, sr, seg_zero_wav) in enumerate(segment_results):
-            if sr != final_sr:
-                # 如果采样率不同，需要进行重采样（通常不会发生）
-                logger.warning(f"⚠️  片段 {i} 采样率 {sr} 与主采样率 {final_sr} 不同，尝试重采样")
-                audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=final_sr)
+        for seg_idx, (_, audio_data, sr) in enumerate(segment_results):
+            # 确保采样率一致
+            if sr != first_sr:
+                audio_data = _resample_audio_if_needed(audio_data, sr, first_sr)
             
             all_audio_segments.append(audio_data)
             
-            # 如果不是最后一个片段，添加静音间隔
-            if i < len(segment_results) - 1:
-                all_audio_segments.append(seg_zero_wav)
+            # 在片段间添加静音（除最后一个片段外）
+            if seg_idx < len(segment_results) - 1:
+                # 创建0.3秒的静音
+                silence = np.zeros(int(first_sr * 0.3), dtype=audio_data.dtype)
+                all_audio_segments.append(silence)
         
-        # 2.5 拼接所有音频
+        # 拼接所有音频
         combined_audio = np.concatenate(all_audio_segments, axis=0)
         
-        # 2.6 标准化音频（防止削波）
+        # 最终归一化
         max_audio = np.abs(combined_audio).max()
-        if max_audio > 1:
+        if max_audio > 1.0:
             combined_audio = combined_audio / max_audio
         
-        # 2.7 包装音频为字节流
-        if is_int32:
-            audio_bytes = pack_audio(all_audio_bytes, (combined_audio * 2147483647).astype(np.int32), final_sr)
-        else:
-            audio_bytes = pack_audio(all_audio_bytes, (combined_audio * 32768).astype(np.int16), final_sr)
-        
-        logger.info(f"✅ 长文本处理完成，总时长: {len(combined_audio)/final_sr:.2f}秒")
+        final_audio = combined_audio
+        final_sr = first_sr
         
     else:
         # ============ 短文本单GPU处理 ============
         logger.info(f"📝 短文本检测 ({len(text)}字 ≤ {LONG_TEXT_THRESHOLD})，使用单GPU处理")
         
-        # 3.1 确保至少一个GPU上有模型
-        ensure_model_loaded(spk)  # 不指定GPU，让函数自动选择
-        
-        # 3.2 确定使用哪个GPU（检查哪个GPU有模型）
+        # 确定使用哪个GPU
         selected_gpu = 0
-        if speaker_list[spk].gpu1_gpt is not None and speaker_list[spk].gpu0_gpt is None:
+        # 检查哪个GPU有模型
+        if speaker.gpu1_gpt is not None and speaker.gpu0_gpt is None:
             selected_gpu = 1
-        elif speaker_list[spk].gpu0_gpt is not None:
+        elif speaker.gpu0_gpt is not None:
             selected_gpu = 0
         else:
             # 两个都没有，随机选一个
             import random
             selected_gpu = random.choice([0, 1])
-            ensure_model_loaded(spk, selected_gpu)
         
+        # 确保模型已加载
+        ensure_model_loaded(spk, selected_gpu)
         logger.info(f"  使用 GPU{selected_gpu} 处理短文本")
         
-        # 3.3 处理单个文本片段
-        audio_data, final_sr, _ = _process_single_segment(
+        # 处理单个文本片段
+        final_audio, final_sr = _process_single_segment(
             text_segment=text,
             refer_wav_path=refer_wav_path,
             prompt_text=prompt_text,
@@ -1117,17 +1152,23 @@ def get_tts_wav(
             spk=spk,
             gpu_index=selected_gpu
         )
-        
-        # 3.4 包装音频为字节流
-        if is_int32:
-            audio_bytes = pack_audio(all_audio_bytes, (audio_data * 2147483647).astype(np.int32), final_sr)
-        else:
-            audio_bytes = pack_audio(all_audio_bytes, (audio_data * 32768).astype(np.int16), final_sr)
     
-    # 4. 返回音频数据
+    # 4. 包装音频为字节流
+    all_audio_bytes = BytesIO()
+    
+    # 根据数据类型编码音频
+    if is_int32:
+        audio_data_int = (final_audio * 2147483647).astype(np.int32)
+    else:
+        audio_data_int = (final_audio * 32767).astype(np.int16)
+    
+    # 根据媒体类型打包音频
     if media_type == "wav":
-        audio_bytes = pack_wav(audio_bytes, final_sr)
+        audio_bytes = pack_wav(audio_data_int, final_sr)
+    else:
+        audio_bytes = pack_audio(all_audio_bytes, audio_data_int, final_sr)
     
+    # 5. 返回音频数据
     if stream_mode == "normal":
         # 流式返回
         audio_bytes, audio_chunk = read_clean_buffer(audio_bytes)
@@ -1135,24 +1176,25 @@ def get_tts_wav(
     else:
         # 一次性返回
         yield audio_bytes.getvalue()
+
 def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_language,
                            text_language, top_k, top_p, temperature, speed,
                            inp_refs, sample_steps, if_sr, spk, gpu_index):
     """
     处理单个文本片段（内部函数，用于并行处理）
-    返回: (audio_data, sampling_rate, zero_wav)
+    返回: (audio_data, sampling_rate)
     """
     try:
         global bigvgan_model, hifigan_model, sv_cn_model
-        # 1. 获取对应GPU上的模型实例
+        
+        # 1. 获取目标GPU
         target_gpu = f"cuda:{gpu_index}"
         
-        # 确保模型已加载
+        # 2. 确保模型已加载到目标GPU
         ensure_model_loaded(spk, gpu_index)
         
+        # 3. 获取对应GPU上的模型实例
         speaker = speaker_list[spk]
-        
-        # 根据GPU索引获取正确的模型实例
         if gpu_index == 0:
             model_instance = {
                 "gpt": speaker.gpu0_gpt,
@@ -1169,7 +1211,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
         if model_instance["gpt"] is None or model_instance["sovits"] is None:
             raise ValueError(f"Model not loaded on GPU {gpu_index} for speaker {spk}")
         
-        # 2. 获取模型实例
+        # 4. 获取模型实例和配置
         infer_sovits = model_instance["sovits"]
         infer_gpt = model_instance["gpt"]
         
@@ -1180,7 +1222,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
         t2s_model = infer_gpt.t2s_model
         max_sec = infer_gpt.max_sec
         
-        # 3. 参数调整
+        # 5. 参数调整（与原始函数相同）
         if version == "v3":
             if sample_steps not in [4, 8, 16, 32, 64, 128]:
                 sample_steps = 32
@@ -1191,7 +1233,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
         if if_sr and version != "v3":
             if_sr = False
         
-        # 4. 准备参考音频
+        # 6. 准备参考音频（与原始函数相同，但指定目标GPU）
         prompt_text = prompt_text.strip("\n")
         if prompt_text[-1] not in splits:
             prompt_text += "。" if prompt_language != "en" else "."
@@ -1199,14 +1241,14 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
         prompt_language, text_segment = prompt_language, text_segment.strip("\n")
         dtype = torch.float16 if is_half == True else torch.float32
         
-        # 5. 将参考音频转移到目标GPU
+        # 创建静音片段（与原始函数相同）
+        zero_wav = np.zeros(int(hps.data.sampling_rate * 0.3), dtype=np.float16 if is_half == True else np.float32)
+        zero_wav_torch = torch.from_numpy(zero_wav)
+        
+        # 7. 参考音频处理（与原始函数相同，但指定目标GPU）
         with torch.no_grad():
             wav16k, sr = librosa.load(refer_wav_path, sr=16000)
             wav16k = torch.from_numpy(wav16k)
-            
-            # 创建静音片段
-            zero_wav = np.zeros(int(hps.data.sampling_rate * 0.3), dtype=np.float16 if is_half == True else np.float32)
-            zero_wav_torch = torch.from_numpy(zero_wav)
             
             if is_half == True:
                 wav16k = wav16k.half().to(target_gpu)
@@ -1217,8 +1259,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
             
             wav16k = torch.cat([wav16k, zero_wav_torch])
             
-            # 修复：检查 SSL 模型所在的设备
-            # 检查 SSL 模型所在的设备
+            # SSL模型处理
             ssl_device = None
             try:
                 if hasattr(ssl_model, 'parameters'):
@@ -1226,17 +1267,13 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                 elif hasattr(ssl_model, 'device'):
                     ssl_device = ssl_model.device
             except Exception as e:
-                logger.warning(f"无法获取SSL模型设备，默认使用CPU: {e}")
                 ssl_device = torch.device("cpu")
             
-            # 根据SSL模型所在的设备处理
             if ssl_device.type != "cpu":
-                # SSL模型在GPU上，将数据移到对应设备
                 wav16k_for_ssl = wav16k.to(ssl_device)
                 ssl_content = ssl_model.model(wav16k_for_ssl.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
                 ssl_content = ssl_content.to(target_gpu)
             else:
-                # SSL模型在CPU上
                 wav16k_cpu = wav16k.cpu()
                 ssl_content = ssl_model.model(wav16k_cpu.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
                 if is_half == True:
@@ -1246,10 +1283,35 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
             codes = vq_model.extract_latent(ssl_content)
             prompt_semantic = codes[0, 0]
             prompt = prompt_semantic.unsqueeze(0).to(target_gpu)
+            
+            # 获取参考频谱（根据模型版本）
+            is_v2pro = version in {"v2Pro", "v2ProPlus"}
+            if version not in {"v3", "v4"}:
+                refers = []
+                if is_v2pro:
+                    sv_emb = []
+                    if sv_cn_model == None:
+                        init_sv_cn()
+                if inp_refs:
+                    for path in inp_refs:
+                        try:
+                            refer, audio_tensor = get_spepc_for_gpu(hps, path, dtype, target_gpu, is_v2pro)
+                            refers.append(refer)
+                            if is_v2pro:
+                                sv_emb.append(sv_cn_model.compute_embedding3(audio_tensor))
+                        except Exception as e:
+                            logger.error(e)
+                if len(refers) == 0:
+                    refers, audio_tensor = get_spepc_for_gpu(hps, refer_wav_path, dtype, target_gpu, is_v2pro)
+                    refers = [refers]
+                    if is_v2pro:
+                        sv_emb = [sv_cn_model.compute_embedding3(audio_tensor)]
+            else:
+                refer, audio_tensor = get_spepc_for_gpu(hps, refer_wav_path, dtype, target_gpu)
         
-        # 6. 文本处理
+        # 8. 文本处理（与原始函数相同，但指定目标GPU）
         texts = text_segment.split("\n")
-        audio_opt_segments = []
+        audio_opt = []  # 存储所有音频片段
         
         for text in texts:
             if only_punc(text):
@@ -1269,7 +1331,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
             all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(target_gpu).unsqueeze(0)
             all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(target_gpu)
             
-            # 7. GPT推理
+            # 9. GPT推理（与原始函数相同，但指定目标GPU）
             with torch.no_grad():
                 pred_semantic, idx = t2s_model.model.infer_panel(
                     all_phoneme_ids,
@@ -1283,32 +1345,42 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                 )
                 pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
             
-            # 8. SoVITS解码（根据模型版本不同）
-            # 在 v3/v4 解码部分，确保正确处理声码器：
+            # 10. SoVITS解码（根据模型版本不同）
             if version not in {"v3", "v4"}:
-                # v1/v2 版本
-                refer_spec = get_spepc_for_gpu(hps, refer_wav_path, dtype, target_gpu)
-                audio = (
-                    vq_model.decode(
-                        pred_semantic,
-                        torch.LongTensor(phones2).to(target_gpu).unsqueeze(0),
-                        refer_spec,
-                        speed=speed
+                # v1/v2/v2Pro 版本
+                if is_v2pro:
+                    audio = (
+                        vq_model.decode(
+                            pred_semantic,
+                            torch.LongTensor(phones2).to(target_gpu).unsqueeze(0),
+                            refers,
+                            speed=speed,
+                            sv_emb=sv_emb,
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()[0, 0]
                     )
-                    .detach()
-                    .cpu()
-                    .numpy()[0, 0]
-                )
-                return audio, hps.data.sampling_rate, zero_wav
+                else:
+                    audio = (
+                        vq_model.decode(
+                            pred_semantic, 
+                            torch.LongTensor(phones2).to(target_gpu).unsqueeze(0), 
+                            refers, 
+                            speed=speed
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()[0, 0]
+                    )
             else:
                 # v3/v4 版本
                 phoneme_ids0 = torch.LongTensor(phones1).to(target_gpu).unsqueeze(0)
                 phoneme_ids1 = torch.LongTensor(phones2).to(target_gpu).unsqueeze(0)
                 
-                refer_spec, _ = get_spepc_for_gpu(hps, refer_wav_path, dtype, target_gpu)
-                fea_ref, ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer_spec)
+                fea_ref, ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
                 
-                # 加载参考音频
+                # 加载参考音频用于mel频谱
                 ref_audio, sr = torchaudio.load(refer_wav_path)
                 ref_audio = ref_audio.to(target_gpu).float()
                 if ref_audio.shape[0] == 2:
@@ -1321,7 +1393,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                 mel2 = mel_fn(ref_audio) if version == "v3" else mel_fn_v4(ref_audio)
                 mel2 = norm_spec(mel2)
                 
-                # ============ v3/v4 解码过程 ============
+                # ============ v3/v4 分块解码过程 ============
                 T_min = min(mel2.shape[2], fea_ref.shape[2])
                 mel2 = mel2[:, :, :T_min]
                 fea_ref = fea_ref[:, :, :T_min]
@@ -1334,7 +1406,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
 
                 chunk_len = Tchunk - T_min
                 mel2 = mel2.to(dtype)
-                fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer_spec, ge, speed)
+                fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge, speed)
 
                 # 分块解码
                 cfm_resss = []
@@ -1367,7 +1439,6 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                             if str(current_device) != target_gpu:
                                 bigvgan_model = bigvgan_model.to(target_gpu)
                         except StopIteration:
-                            # 模型没有参数，直接移动
                             bigvgan_model = bigvgan_model.to(target_gpu)
                     vocoder_model = bigvgan_model
                 else:  # v4
@@ -1380,26 +1451,68 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                             if str(current_device) != target_gpu:
                                 hifigan_model = hifigan_model.to(target_gpu)
                         except StopIteration:
-                            # 模型没有参数，直接移动
                             hifigan_model = hifigan_model.to(target_gpu)
                     vocoder_model = hifigan_model
 
                 # 生成音频
                 with torch.inference_mode():
+                    # 确保输入数据类型与声码器一致
+                    model_dtype = next(vocoder_model.parameters()).dtype
+                    if cfm_res.dtype != model_dtype:
+                        cfm_res = cfm_res.to(model_dtype)
+                    
                     wav_gen = vocoder_model(cfm_res)
                     audio = wav_gen[0][0].cpu().detach().numpy()
-                    
-                    # 9. 返回音频数据
-                    # 注意：这里需要将zero_wav作为numpy数组返回，用于片段间的连接
-                    return audio, hps.data.sampling_rate, zero_wav
+            
+            # 11. 音频归一化（每行独立归一化，防止削波）
+            max_audio = np.abs(audio).max()
+            if max_audio > 1:
+                audio = audio / max_audio
+            
+            # 添加到音频列表
+            audio_opt.append(audio)
+            audio_opt.append(zero_wav)  # 添加静音段
         
+        # 12. 合并所有音频片段
+        if audio_opt:
+            combined_audio = np.concatenate(audio_opt, axis=0)
+            
+            # 最终归一化
+            max_audio = np.abs(combined_audio).max()
+            if max_audio > 1.0:
+                combined_audio = combined_audio / max_audio
+            
+            # 13. 确定采样率（根据模型版本）
+            if version in {"v1", "v2", "v2Pro", "v2ProPlus"}:
+                sr = 32000
+            elif version == "v3":
+                sr = 48000 if if_sr else 24000
+            else:  # v4
+                sr = 48000
+            
+            # 14. 超分处理（仅v3且启用超分）
+            if if_sr and version == "v3" and sr == 24000:
+                audio_opt_tensor = torch.from_numpy(combined_audio).float().to(target_gpu)
+                audio_opt_tensor, sr = audio_sr_for_gpu(audio_opt_tensor.unsqueeze(0), sr, target_gpu)
+                combined_audio = audio_opt_tensor.cpu().numpy()[0]
+                
+                # 超分后再次归一化
+                max_audio = np.abs(combined_audio).max()
+                if max_audio > 1.0:
+                    combined_audio = combined_audio / max_audio
+                sr = 48000
+            combined_audio = _validate_audio_output(combined_audio, sr)
+            return combined_audio, sr
+        else:
+            # 如果没有生成音频，返回静音
+            silence = np.zeros(16000, dtype=np.float32)
+            return silence, 16000
+            
     except Exception as e:
         logger.error(f"❌ GPU{gpu_index} 处理失败: {e}")
         raise
-    return None, None, None  # 或者根据实际情况返回适当的默认值
 
-
-def get_spepc_for_gpu(hps, filename, dtype, target_gpu):
+def get_spepc_for_gpu(hps, filename, dtype, target_gpu, is_v2pro=False):
     """
     为指定GPU获取频谱（修改自原get_spepc函数）
     """
@@ -1431,9 +1544,147 @@ def get_spepc_for_gpu(hps, filename, dtype, target_gpu):
     )
     spec = spec.to(dtype)
     
+    if is_v2pro == True:
+        audio = resample(audio, sr1, 16000, target_gpu).to(dtype)
+    
     return spec, audio
 
 
+def audio_sr_for_gpu(audio, sr, target_gpu):
+    """
+    为指定GPU进行音频超分
+    """
+    global sr_model
+    if sr_model == None:
+        from tools.audio_sr import AP_BWE
+        try:
+            sr_model = AP_BWE(target_gpu, DictToAttrRecursive)
+        except FileNotFoundError:
+            logger.info("你没有下载超分模型的参数，因此不进行超分。")
+            return audio.cpu().detach().numpy(), sr
+    return sr_model(audio, sr)
+
+def _get_model_specific_params(version, if_sr):
+    """
+    根据模型版本获取特定参数
+    返回: (sample_rate, needs_vocoder, vocoder_type)
+    """
+    if version in {"v1", "v2", "v2Pro", "v2ProPlus"}:
+        sr = 32000
+        needs_vocoder = False
+        vocoder_type = None
+    elif version == "v3":
+        if if_sr:
+            sr = 48000  # 超分后
+        else:
+            sr = 24000  # 原始
+        needs_vocoder = True
+        vocoder_type = "bigvgan"
+    else:  # v4
+        sr = 48000
+        needs_vocoder = True
+        vocoder_type = "hifigan"
+    
+    return sr, needs_vocoder, vocoder_type
+
+def _get_ssl_content(wav16k, target_gpu):
+    """
+    获取SSL内容，处理设备间数据传输
+    """
+    ssl_device = None
+    try:
+        if hasattr(ssl_model, 'parameters'):
+            ssl_device = next(ssl_model.parameters()).device
+        elif hasattr(ssl_model, 'device'):
+            ssl_device = ssl_model.device
+    except Exception as e:
+        logger.warning(f"无法获取SSL模型设备，默认使用CPU: {e}")
+        ssl_device = torch.device("cpu")
+    
+    # 根据SSL模型设备处理
+    ssl_content = _get_ssl_content(wav16k, target_gpu)
+    
+    return ssl_content
+
+def check_gpu_memory(gpu_index=0):
+    """
+    检查GPU内存使用情况
+    """
+    if not torch.cuda.is_available():
+        return 0, 0
+    
+    try:
+        torch.cuda.set_device(gpu_index)
+        allocated = torch.cuda.memory_allocated(gpu_index) / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved(gpu_index) / 1024**3   # GB
+        total = torch.cuda.get_device_properties(gpu_index).total_memory / 1024**3
+        
+        free = total - allocated
+        
+        logger.debug(f"GPU{gpu_index}: 已用 {allocated:.2f}GB / 总计 {total:.2f}GB, 空闲 {free:.2f}GB")
+        return free, total
+    except Exception as e:
+        logger.warning(f"检查GPU{gpu_index}内存失败: {e}")
+        return 0, 0
+
+def _resample_audio_if_needed(audio_data, orig_sr, target_sr):
+    """
+    如果需要，对音频进行重采样
+    """
+    if orig_sr == target_sr:
+        return audio_data
+    
+    try:
+        # 使用librosa进行高质量重采样
+        resampled = librosa.resample(audio_data, orig_sr=orig_sr, target_sr=target_sr)
+        logger.debug(f"音频重采样: {orig_sr}Hz -> {target_sr}Hz")
+        return resampled
+    except Exception as e:
+        logger.error(f"音频重采样失败: {e}")
+        # 如果重采样失败，返回原始音频并记录警告
+        return audio_data
+
+def _safe_model_load(model_func, *args, **kwargs):
+    """
+    安全的模型加载，带重试机制
+    """
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            return model_func(*args, **kwargs)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(f"内存不足，尝试 {attempt+1}/{max_retries}...")
+            torch.cuda.empty_cache()
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(1)  # 等待1秒再重试
+        except Exception as e:
+            logger.error(f"模型加载失败: {e}")
+            raise
+
+def _validate_audio_output(audio_data, sample_rate):
+    """
+    验证音频输出是否有效
+    """
+    if audio_data is None or len(audio_data) == 0:
+        raise ValueError("生成的音频数据为空")
+    
+    if sample_rate <= 0:
+        raise ValueError(f"无效的采样率: {sample_rate}")
+    
+    # 检查音频数据是否包含无效值
+    if np.any(np.isnan(audio_data)) or np.any(np.isinf(audio_data)):
+        logger.warning("音频数据包含NaN或Inf值，尝试修复...")
+        audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    # 检查幅度是否过大
+    max_amplitude = np.abs(audio_data).max()
+    if max_amplitude > 10.0:  # 明显过大
+        logger.warning(f"音频幅度过大 ({max_amplitude:.2f})，进行归一化")
+        audio_data = audio_data / max_amplitude
+    
+    return audio_data
+    
 def handle_control(command):
     if command == "restart":
         os.execl(g_config.python_exec, g_config.python_exec, *sys.argv)
@@ -1919,3 +2170,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         print("\n👋 接收到中断信号，正在关闭...")
+
