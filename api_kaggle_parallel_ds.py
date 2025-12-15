@@ -36,175 +36,29 @@ model_access_times = {}
 # 当前已加载的模型计数
 loaded_models_count = 0
 # 长文本阈值
-LONG_TEXT_THRESHOLD = 70
+LONG_TEXT_THRESHOLD = long_text 
 
-# --- 从这里开始，复制 gradio_tunneling 的核心代码 (放在文件顶部的 import 区域) ---
-import atexit
-import platform
-import stat
-import time
-from pathlib import Path
-from typing import List, Optional
+# ============ GPU环境检测 ============
+import torch
 
-import requests
-
-VERSION = "0.2"
-CURRENT_TUNNELS: List["Tunnel"] = []
-
-machine = platform.machine()
-if machine == "x86_64":
-    machine = "amd64"
-
-BINARY_REMOTE_NAME = f"frpc_{platform.system().lower()}_{machine.lower()}"
-EXTENSION = ".exe" if os.name == "nt" else ""
-BINARY_URL = f"https://cdn-media.huggingface.co/frpc-gradio-{VERSION}/{BINARY_REMOTE_NAME}{EXTENSION}"
-
-BINARY_FILENAME = f"{BINARY_REMOTE_NAME}_v{VERSION}"
-BINARY_FOLDER = Path(__file__).parent.absolute()
-BINARY_PATH = f"{BINARY_FOLDER / BINARY_FILENAME}"
-
-TUNNEL_TIMEOUT_SECONDS = 30
-TUNNEL_ERROR_MESSAGE = (
-    "Could not create share URL. "
-    "Please check the appended log from frpc for more information:"
-)
-
-GRADIO_API_SERVER = "https://api.gradio.app/v2/tunnel-request"
-GRADIO_SHARE_SERVER_ADDRESS = None
-
-
-class Tunnel:
-    def __init__(self, remote_host, remote_port, local_host, local_port, share_token):
-        self.proc = None
-        self.url = None
-        self.remote_host = remote_host
-        self.remote_port = remote_port
-        self.local_host = local_host
-        self.local_port = local_port
-        self.share_token = share_token
-
-    @staticmethod
-    def download_binary():
-        if not Path(BINARY_PATH).exists():
-            resp = requests.get(BINARY_URL)
-
-            if resp.status_code == 403:
-                raise OSError(
-                    f"Cannot set up a share link as this platform is incompatible. Please "
-                    f"create a GitHub issue with information about your platform: {platform.uname()}"
-                )
-
-            resp.raise_for_status()
-
-            # Save file data to local copy
-            with open(BINARY_PATH, "wb") as file:
-                file.write(resp.content)
-            st = os.stat(BINARY_PATH)
-            os.chmod(BINARY_PATH, st.st_mode | stat.S_IEXEC)
-
-    def start_tunnel(self) -> str:
-        self.download_binary()
-        self.url = self._start_tunnel(BINARY_PATH)
-        return self.url
-
-    def kill(self):
-        if self.proc is not None:
-            print(f"Killing tunnel {self.local_host}:{self.local_port} <> {self.url}")
-            self.proc.terminate()
-            self.proc = None
-
-    def _start_tunnel(self, binary: str) -> str:
-        CURRENT_TUNNELS.append(self)
-        command = [
-            binary,
-            "http",
-            "-n",
-            self.share_token,
-            "-l",
-            str(self.local_port),
-            "-i",
-            self.local_host,
-            "--uc",
-            "--sd",
-            "random",
-            "--ue",
-            "--server_addr",
-            f"{self.remote_host}:{self.remote_port}",
-            "--disable_log_color",
-        ]
-        self.proc = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        atexit.register(self.kill)
-        return self._read_url_from_tunnel_stream()
-
-    def _read_url_from_tunnel_stream(self) -> str:
-        start_timestamp = time.time()
-
-        log = []
-        url = ""
-
-        def _raise_tunnel_error():
-            log_text = "\n".join(log)
-            print(log_text, file=sys.stderr)
-            raise ValueError(f"{TUNNEL_ERROR_MESSAGE}\n{log_text}")
-
-        while url == "":
-            # check for timeout and log
-            if time.time() - start_timestamp >= TUNNEL_TIMEOUT_SECONDS:
-                _raise_tunnel_error()
-
-            assert self.proc is not None
-            if self.proc.stdout is None:
-                continue
-
-            line = self.proc.stdout.readline()
-            line = line.decode("utf-8")
-
-            if line == "":
-                continue
-
-            log.append(line.strip())
-
-            if "start proxy success" in line:
-                result = re.search("start proxy success: (.+)\n", line)
-                if result is None:
-                    _raise_tunnel_error()
-                else:
-                    url = result.group(1)
-            elif "login to server failed" in line:
-                _raise_tunnel_error()
-
-        return url
-
-
-def setup_tunnel(
-    local_host: str,
-    local_port: int,
-    share_token: str,
-    share_server_address: Optional[str],
-) -> str:
-    share_server_address = (
-        GRADIO_SHARE_SERVER_ADDRESS
-        if share_server_address is None
-        else share_server_address
-    )
-    if share_server_address is None:
-        response = requests.get(GRADIO_API_SERVER)
-        if not (response and response.status_code == 200):
-            raise RuntimeError("Could not get share link from Gradio API Server.")
-        payload = response.json()[0]
-        remote_host, remote_port = payload["host"], int(payload["port"])
+def check_gpu_availability():
+    """检测可用的GPU数量"""
+    gpu_count = torch.cuda.device_count()
+    logger.info(f"✅ 检测到 {gpu_count} 个GPU设备")
+    
+    if gpu_count == 0:
+        logger.warning("❌ 未检测到GPU，将使用CPU模式")
+        return 0, ["cpu"]
+    elif gpu_count == 1:
+        logger.info("🔧 单GPU环境，启用单卡优化模式")
+        return 1, ["cuda:0"]
     else:
-        remote_host, remote_port = share_server_address.split(":")
-        remote_port = int(remote_port)
-    try:
-        tunnel = Tunnel(remote_host, remote_port, local_host, local_port, share_token)
-        address = tunnel.start_tunnel()
-        return address
-    except Exception as e:
-        raise RuntimeError(str(e)) from e
-# --- 复制到此结束 ---
+        logger.info(f"🚀 多GPU环境，启用并行模式")
+        return gpu_count, [f"cuda:{i}" for i in range(gpu_count)]
+
+# 检测GPU
+GPU_COUNT, GPU_LIST = check_gpu_availability()
+IS_MULTI_GPU = GPU_COUNT > 1
 
 class DefaultRefer:
     def __init__(self, path, text, language):
@@ -908,7 +762,7 @@ def unload_least_recently_used():
 def ensure_model_loaded(speaker_id, gpu_index=None):
     """
     确保指定说话人的模型加载到指定的GPU上
-    gpu_index: 0或1，为None时自动选择
+    自动适配单GPU环境
     """
     from time import time as ttime
     
@@ -923,6 +777,20 @@ def ensure_model_loaded(speaker_id, gpu_index=None):
     
     # 更新全局访问记录（用于LRU淘汰）
     model_access_times[speaker_id] = ttime()
+
+    # 单GPU环境：只使用GPU 0
+    if not IS_MULTI_GPU:
+        gpu_index = 0
+        target_gpu = "cuda:0"
+        
+        if speaker.gpu0_gpt is None:
+            if loaded_models_count >= max_models:
+                unload_least_recently_used()
+            
+            speaker.gpu0_gpt = get_gpt_weights(speaker.gpt_path, target_gpu)
+            speaker.gpu0_sovits = get_sovits_weights(speaker.sovits_path, target_gpu)
+            loaded_models_count += 1
+        return
     
     # 如果指定了GPU索引
     if gpu_index is not None:
@@ -1011,9 +879,15 @@ def get_tts_wav(
     import asyncio
     import concurrent.futures
     import numpy as np
-    
-    # 1. 智能文本拆分
-    is_long, text_segments = split_long_text(text, LONG_TEXT_THRESHOLD)
+
+    # 根据GPU环境决定是否启用并行
+    if IS_MULTI_GPU:
+        is_long, text_segments = split_long_text(text, LONG_TEXT_THRESHOLD)
+    else:
+        # 单GPU环境：长文本也使用单卡处理
+        is_long = False
+        text_segments = [text]
+        logger.info("🔧 单GPU环境，禁用并行处理")
     
     # 更新模型访问时间
     if spk in speaker_list:
@@ -1748,6 +1622,11 @@ def split_long_text(text, threshold=LONG_TEXT_THRESHOLD):
     - is_long: 是否为长文本
     - segments: 文本片段列表，长文本时为2段，短文本时为1段
     """
+    # 单GPU环境不进行并行拆分
+    if not IS_MULTI_GPU:
+        return False, [text]
+        
+    # 多GPU环境拆分 
     if len(text) <= threshold:
         return False, [text]
     
@@ -1907,9 +1786,7 @@ parser.add_argument("-cp", "--cut_punc", type=str, default="", help="文本切�
 parser.add_argument("-hb", "--hubert_path", type=str, default=g_config.cnhubert_path, help="覆盖config.cnhubert_path")
 parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, help="覆盖config.bert_path")
 parser.add_argument("-mm", "--max_models", type=int, default=3, help="最大同时加载模型数量")
-# 添加下面这行来支持自定义子域名
-parser.add_argument("--sd", "--subdomain", type=str, default=None, help="指定隧道使用的固定子域名 (例如: your-name)")
-
+parser.add_argument("-lt", "--long_text", type=int, default=70, help="长文本界限")
 args = parser.parse_args()
 sovits_path = args.sovits_path
 gpt_path = args.gpt_path
@@ -1920,6 +1797,7 @@ cnhubert_base_path = args.hubert_path
 bert_path = args.bert_path
 default_cut_punc = args.cut_punc
 max_models = args.max_models
+long_text = args.long_text
 
 # 应用参数配置
 default_refer = DefaultRefer(args.default_refer_path, args.default_refer_text, args.default_refer_language)
@@ -2107,67 +1985,4 @@ async def tts_endpoint(
 
 
 if __name__ == "__main__":
-    import threading
-    import time
-    import secrets
-    
-    # 1. 启动 FastAPI 服务器线程
-    def run_server():
-        uvicorn.run(app, host=host, port=port, workers=1)
-    
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
-    print(f"🚀 启动内部 FastAPI 服务器 (端口: {port})...")
-    time.sleep(3)  # 等待服务器启动
-    
-    # 2. 创建公开隧道（支持自定义子域名）
-    print("🌐 正在创建公开隧道链接...")
-    try:
-        # 如果用户通过 --sd 指定了子域名，就使用它，否则生成随机令牌
-        share_token = args.sd if args.sd else secrets.token_urlsafe(32)
-        
-        public_url = setup_tunnel(
-            local_host="127.0.0.1",
-            local_port=port,
-            share_token=share_token,
-            share_server_address=None,
-        )
-        
-        print(f"\n{'='*60}")
-        print("✅ 隧道创建成功！您的公开访问信息：")
-        print(f"{'='*60}")
-        
-        # 显示子域名信息
-        if args.sd:
-            print(f"🔧 使用固定子域名: {args.sd}")
-            print(f"💡 提示：下次可使用相同命令保持域名不变")
-        else:
-            print(f"🔧 使用随机令牌: {share_token[:16]}...")
-            
-        print(f"📢 公开 URL: {public_url}")
-        print(f"🔗 API 根路径: {public_url}/")
-        print(f"👥 说话人列表: {public_url}/voice/speakers")
-        print(f"🔄 模型切换: {public_url}/set_model")
-        print(f"{'='*60}")
-        print(f"⏳ 此链接默认有效期为 72 小时。")
-        print(f"{'='*60}\n")
-        
-    except requests.exceptions.ConnectionError:
-        print(f"\n⚠️  网络错误：无法连接到 Gradio 隧道服务器。")
-        print(f"   这可能是因为 Kaggle 的网络限制。")
-        print(f"   您仍可通过以下本地地址访问 API：")
-        print(f"   • http://localhost:{port}")
-        print(f"   • http://{host}:{port}")
-    except Exception as e:
-        print(f"\n❌ 创建隧道时发生意外错误：{type(e).__name__}: {e}")
-        print(f"   备用本地地址：http://localhost:{port}")
-    
-    # 3. 主循环
-    try:
-        print("🛠️  服务运行中。按 Ctrl+C 终止。")
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-
-        print("\n👋 接收到中断信号，正在关闭...")
-
+    uvicorn.run(app, host=host, port=port, workers=1)
