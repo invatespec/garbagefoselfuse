@@ -31,28 +31,6 @@ import config as global_config
 import logging
 import subprocess
 
-# ============ GPU环境检测 ============
-import torch
-
-def check_gpu_availability():
-    """检测可用的GPU数量"""
-    gpu_count = torch.cuda.device_count()
-    logger.info(f"✅ 检测到 {gpu_count} 个GPU设备")
-    
-    if gpu_count == 0:
-        logger.warning("❌ 未检测到GPU，将使用CPU模式")
-        return 0, ["cpu"]
-    elif gpu_count == 1:
-        logger.info("🔧 单GPU环境，启用单卡优化模式")
-        return 1, ["cuda:0"]
-    else:
-        logger.info(f"🚀 多GPU环境，启用并行模式")
-        return gpu_count, [f"cuda:{i}" for i in range(gpu_count)]
-
-# 检测GPU
-GPU_COUNT, GPU_LIST = check_gpu_availability()
-IS_MULTI_GPU = GPU_COUNT > 1
-
 class DefaultRefer:
     def __init__(self, path, text, language):
         self.path = args.default_refer_path
@@ -875,7 +853,7 @@ def get_tts_wav(
 
     # 根据GPU环境决定是否启用并行
     if IS_MULTI_GPU:
-        is_long, text_segments = split_long_text(text, LONG_TEXT_THRESHOLD)
+        is_long, text_segments = split_long_text(text, long_text_threshold)
     else:
         # 单GPU环境：长文本也使用单卡处理
         is_long = False
@@ -895,7 +873,7 @@ def get_tts_wav(
     # 3. 根据是否长文本选择处理方式
     if is_long:
         # ============ 长文本并行处理 ============
-        logger.info(f"📖 长文本检测 ({len(text)}字 > {LONG_TEXT_THRESHOLD})，启用双GPU并行处理")
+        logger.info(f"📖 长文本检测 ({len(text)}字 > {long_text_threshold})，启用双GPU并行处理")
         
         # 3.1 确保两个GPU上都有模型
         ensure_model_loaded(spk, 0)
@@ -984,7 +962,7 @@ def get_tts_wav(
         
     else:
         # ============ 短文本单GPU处理 ============
-        logger.info(f"📝 短文本检测 ({len(text)}字 ≤ {LONG_TEXT_THRESHOLD})，使用单GPU处理")
+        logger.info(f"📝 短文本检测 ({len(text)}字 ≤ {long_text_threshold})，使用单GPU处理")
         
         # 确定使用哪个GPU
         selected_gpu = 0
@@ -1608,7 +1586,7 @@ def get_speaker_sovits_model(speaker_id, gpu_index=0):
     else:
         raise ValueError(f"Invalid GPU index: {gpu_index}")
     
-def split_long_text(text, threshold=LONG_TEXT_THRESHOLD):
+def split_long_text(text, threshold=long_text_threshold):
     """
     智能拆分长文本，尽量在自然停顿处拆分
     返回：(is_long, segments)
@@ -1717,16 +1695,37 @@ def handle(
         media_type="audio/" + media_type,
     )
 
+# ============ GPU环境检测 ============
+def check_gpu_availability():
+    """检测可用的GPU数量"""
+    gpu_count = torch.cuda.device_count()
+    logger.info(f"✅ 检测到 {gpu_count} 个GPU设备")
+    
+    if gpu_count == 0:
+        logger.warning("❌ 未检测到GPU，将使用CPU模式")
+        return 0, ["cpu"]
+    elif gpu_count == 1:
+        logger.info("🔧 单GPU环境，启用单卡优化模式")
+        return 1, ["cuda:0"]
+    else:
+        logger.info(f"🚀 多GPU环境，启用并行模式")
+        return gpu_count, [f"cuda:{i}" for i in range(gpu_count)]
+
+
 # --------------------------------
 # 初始化部分
 # --------------------------------
+
+# 检测GPU
+GPU_COUNT, GPU_LIST = check_gpu_availability()
+IS_MULTI_GPU = GPU_COUNT > 1
 
 # 模型实例访问记录，用于LRU淘汰
 model_access_times = {}
 # 当前已加载的模型计数
 loaded_models_count = 0
 # 长文本阈值
-LONG_TEXT_THRESHOLD = long_text 
+long_text_threshold = 70 
 
 dict_language = {
     "中文": "all_zh",
@@ -1787,7 +1786,7 @@ parser.add_argument("-cp", "--cut_punc", type=str, default="", help="文本切�
 parser.add_argument("-hb", "--hubert_path", type=str, default=g_config.cnhubert_path, help="覆盖config.cnhubert_path")
 parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, help="覆盖config.bert_path")
 parser.add_argument("-mm", "--max_models", type=int, default=3, help="最大同时加载模型数量")
-parser.add_argument("-lt", "--long_text", type=int, default=70, help="长文本界限")
+parser.add_argument("-ltt", "--long_text_threshold", type=int, default=70, help="长文本界限")
 args = parser.parse_args()
 sovits_path = args.sovits_path
 gpt_path = args.gpt_path
@@ -1798,7 +1797,7 @@ cnhubert_base_path = args.hubert_path
 bert_path = args.bert_path
 default_cut_punc = args.cut_punc
 max_models = args.max_models
-long_text = args.long_text
+long_text_threshold = args.long_text_threshold
 
 # 应用参数配置
 default_refer = DefaultRefer(args.default_refer_path, args.default_refer_text, args.default_refer_language)
@@ -1987,4 +1986,5 @@ async def tts_endpoint(
 
 if __name__ == "__main__":
     uvicorn.run(app, host=host, port=port, workers=1)
+
 
