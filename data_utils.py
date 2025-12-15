@@ -11,10 +11,7 @@ from text import cleaned_text_to_sequence
 from config import config
 
 """Multi speaker version"""
-import logging
-# 创建全局logger，避免依赖外部logger
-data_logger = logging.getLogger("data_utils")
-data_logger.setLevel(logging.WARNING)
+
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     """
@@ -52,88 +49,33 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
-        self.valid_indices = []
-        self.problematic_indices = set()  # 存储问题索引
-        self._fast_validate_data()  # 使用快速验证
+        self.valid_indices = []  # 新增：存储有效索引
+        self._validate_all_data()  # 新增：验证所有数据
 
-    def _fast_validate_data(self):
-        """快速验证数据，使用多进程并行"""
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        import multiprocessing as mp
-        
-        data_logger.info(f"开始快速验证 {len(self.audiopaths_sid_text)} 条数据...")
-        
-        # 使用进程池并行验证
-        n_workers = min(mp.cpu_count(), 8)  # 限制进程数
-        batch_size = 100  # 每批验证的数量
-        
-        # 分批处理
-        all_indices = list(range(len(self.audiopaths_sid_text)))
-        batches = [all_indices[i:i+batch_size] for i in range(0, len(all_indices), batch_size)]
-        
+    def _validate_all_data(self):
+        """预验证所有数据，过滤有问题样本"""
+        logger.info("开始验证数据集...")
         self.valid_indices = []
-        total_valid = 0
-        total_problematic = 0
+        problematic_count = 0
         
-        # 单进程验证函数
-        def validate_batch(batch_indices):
-            valid_in_batch = []
-            problematic_in_batch = []
-            
-            for idx in batch_indices:
-                try:
-                    # 快速检查：只需验证BERT和音素长度是否匹配
-                    audiopath, sid, language, text, phones, tone, word2ph = self.audiopaths_sid_text[idx]
-                    
-                    # 1. 加载BERT文件
-                    bert_path = audiopath.replace(".wav", ".bert.pt")
-                    bert = torch.load(bert_path, map_location='cpu')
-                    
-                    # 2. 计算音素长度
-                    phone_list = phones.split(" ")
-                    if self.add_blank:
-                        phone_len = len(phone_list) * 2 + 1
-                    else:
-                        phone_len = len(phone_list)
-                    
-                    # 3. 验证长度
-                    if bert.shape[-1] == phone_len:
-                        valid_in_batch.append(idx)
-                    else:
-                        problematic_in_batch.append((idx, bert.shape[-1], phone_len))
-                        
-                except Exception as e:
-                    problematic_in_batch.append((idx, str(e)))
-            
-            return valid_in_batch, problematic_in_batch
-        
-        # 使用进程池并行处理
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(validate_batch, batch): i for i, batch in enumerate(batches)}
-            
-            for future in tqdm(as_completed(futures), total=len(batches), desc="验证数据"):
-                valid_batch, problematic_batch = future.result()
-                self.valid_indices.extend(valid_batch)
-                total_valid += len(valid_batch)
-                total_problematic += len(problematic_batch)
+        for idx in tqdm(range(len(self.audiopaths_sid_text)), desc="验证数据"):
+            try:
+                # 尝试获取数据
+                audiopath_sid_text = self.audiopaths_sid_text[idx]
+                phones, spec, wav, sid, tone, language, bert, emo = \
+                    self.get_audio_text_speaker_pair(audiopath_sid_text)
                 
-                # 记录问题数据
-                for item in problematic_batch:
-                    if len(item) == 3:
-                        idx, bert_len, phone_len = item
-                        self.problematic_indices.add(idx)
-                        data_logger.debug(f"数据 {idx} 长度不匹配: bert_len={bert_len}, phone_len={phone_len}")
-                    else:
-                        idx, error = item
-                        self.problematic_indices.add(idx)
-                        data_logger.debug(f"数据 {idx} 加载失败: {error}")
+                # 额外验证：检查BERT和音素长度是否一致
+                if bert.shape[-1] == len(phones):
+                    self.valid_indices.append(idx)
+                else:
+                    logger.warning(f"数据 {idx} 长度不匹配: bert_len={bert.shape[-1]}, phone_len={len(phones)}")
+                    problematic_count += 1
+            except Exception as e:
+                logger.warning(f"数据 {idx} 加载失败: {e}")
+                problematic_count += 1
         
-        data_logger.info(f"验证完成: 有效数据 {total_valid} 条, 问题数据 {total_problematic} 条")
-        
-        # 如果没有有效数据，使用所有数据（兼容模式）
-        if len(self.valid_indices) == 0:
-            data_logger.warning("没有有效数据，使用所有数据（可能出错）")
-            self.valid_indices = list(range(len(self.audiopaths_sid_text)))
+        logger.info(f"验证完成: 有效数据 {len(self.valid_indices)} 条, 问题数据 {problematic_count} 条")
     
     def __getitem__(self, index):
         # 使用验证后的索引
@@ -248,6 +190,29 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             word2ph[0] += 1
         
         bert_path = wav_path.replace(".wav", ".bert.pt")
+        bert_len = bert.shape[-1]
+        phone_len = len(phone)
+        
+        if bert_len != phone_len:
+            # 使用最小长度
+            min_len = min(bert_len, phone_len)
+            if min_len > 0:
+                bert = bert[:, :min_len]
+                phone = phone[:min_len]
+                tone = tone[:min_len]
+                language = language[:min_len]
+            else:
+                # 如果长度都为0，创建空数据
+                bert = torch.zeros((1024, 1)) if bert_len == 0 else bert
+                phone = [0] if phone_len == 0 else phone
+                tone = [0] if phone_len == 0 else tone
+                language = [0] if phone_len == 0 else language
+        
+        phone = torch.LongTensor(phone)
+        tone = torch.LongTensor(tone)
+        language = torch.LongTensor(language)
+        return bert, phone, tone, language
+        
         try:
             bert = torch.load(bert_path)
             
