@@ -11,7 +11,9 @@ from text import cleaned_text_to_sequence
 from config import config
 
 """Multi speaker version"""
-
+import multiprocessing as mp
+from multiprocessing import Pool, Manager
+import math
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     """
@@ -50,32 +52,149 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
         self.valid_indices = []  # 新增：存储有效索引
-        self._validate_all_data()  # 新增：验证所有数据
-
-    def _validate_all_data(self):
-        """预验证所有数据，过滤有问题样本"""
-        logger.info("开始验证数据集...")
-        self.valid_indices = []
-        problematic_count = 0
+        self._parallel_validate_data()  # 改为并行验证
         
-        for idx in tqdm(range(len(self.audiopaths_sid_text)), desc="验证数据"):
-            try:
-                # 尝试获取数据
-                audiopath_sid_text = self.audiopaths_sid_text[idx]
-                phones, spec, wav, sid, tone, language, bert, emo = \
-                    self.get_audio_text_speaker_pair(audiopath_sid_text)
+        # 根据数据量选择验证模式
+        data_size = len(self.audiopaths_sid_text)
+        if data_size > 10000:
+            # 大数据集：使用快速验证
+            logger.info(f"数据集较大 ({data_size}条)，使用快速验证模式")
+            problematic_data = self._quick_validate_data()
+            
+            # 对有问题数据再进行详细验证
+            if problematic_data:
+                logger.info("对问题数据进行详细验证...")
+                self._detailed_validate_problematic(problematic_data)
+        else:
+            # 小数据集：使用并行验证
+            logger.info(f"数据集较小 ({data_size}条)，使用并行验证模式")
+            self._parallel_validate_data()
+        
+     def _validate_single_item(self, args):
+        """单条数据验证函数，用于多进程"""
+        idx, audiopath_sid_text, hparams_dict = args
+        
+        try:
+            # 复制hparams设置
+            from copy import deepcopy
+            class SimpleHParams:
+                def __init__(self, d):
+                    for k, v in d.items():
+                        setattr(self, k, v)
+            
+            hparams = SimpleHParams(hparams_dict)
+            
+            # 模拟get_text方法
+            audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
+            
+            # 检查基础条件
+            if hparams.min_text_len <= len(phones) and len(phones) <= hparams.max_text_len:
+                phones_list = phones.split(" ")
+                tone_list = [int(i) for i in tone.split(" ")]
+                word2ph_list = [int(i) for i in word2ph.split(" ")]
                 
-                # 额外验证：检查BERT和音素长度是否一致
-                if bert.shape[-1] == len(phones):
-                    self.valid_indices.append(idx)
-                else:
-                    logger.warning(f"数据 {idx} 长度不匹配: bert_len={bert.shape[-1]}, phone_len={len(phones)}")
-                    problematic_count += 1
-            except Exception as e:
-                logger.warning(f"数据 {idx} 加载失败: {e}")
-                problematic_count += 1
+                # 检查BERT文件是否存在
+                bert_path = audiopath.replace(".wav", ".bert.pt")
+                if not os.path.exists(bert_path):
+                    return idx, False, "BERT文件不存在"
+                
+                # 检查音频文件是否存在
+                if not os.path.exists(audiopath):
+                    return idx, False, "音频文件不存在"
+                
+                # 加载BERT文件并检查长度
+                try:
+                    bert = torch.load(bert_path, map_location='cpu')
+                    bert_len = bert.shape[-1]
+                    
+                    # 计算音素长度（考虑add_blank）
+                    phone_len = len(phones_list)
+                    if hparams.add_blank:
+                        phone_len = phone_len * 2 + 1
+                    
+                    if bert_len == phone_len:
+                        return idx, True, "成功"
+                    else:
+                        return idx, False, f"长度不匹配: bert={bert_len}, phone={phone_len}"
+                        
+                except Exception as e:
+                    return idx, False, f"加载BERT失败: {str(e)}"
+            else:
+                return idx, False, f"音素长度超出范围: {len(phones)}"
+                
+        except Exception as e:
+            return idx, False, f"验证异常: {str(e)}"
+    
+    def _parallel_validate_data(self):
+        """并行验证所有数据"""
+        logger.info("开始并行验证数据集...")
         
-        logger.info(f"验证完成: 有效数据 {len(self.valid_indices)} 条, 问题数据 {problematic_count} 条")
+        # 准备hparams字典（可序列化）
+        hparams_dict = {
+            'min_text_len': self.min_text_len,
+            'max_text_len': self.max_text_len,
+            'add_blank': self.add_blank,
+            'spk2id': self.spk_map,
+        }
+        
+        # 准备任务参数
+        tasks = [(idx, item, hparams_dict) 
+                for idx, item in enumerate(self.audiopaths_sid_text)]
+        
+        # 确定进程数（使用CPU核心数）
+        num_workers = min(mp.cpu_count(), 8)  # 最多8个进程
+        logger.info(f"使用 {num_workers} 个进程进行验证")
+        
+        valid_indices = []
+        problematic_data = []
+        
+        # 分批处理，避免内存问题
+        batch_size = 1000
+        num_batches = math.ceil(len(tasks) / batch_size)
+        
+        with Pool(processes=num_workers) as pool:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(tasks))
+                batch_tasks = tasks[start_idx:end_idx]
+                
+                logger.info(f"验证批次 {batch_idx + 1}/{num_batches} ({len(batch_tasks)}条数据)")
+                
+                # 并行处理批次
+                results = pool.map(self._validate_single_item, batch_tasks)
+                
+                # 处理结果
+                for idx, is_valid, message in results:
+                    if is_valid:
+                        valid_indices.append(idx)
+                    else:
+                        problematic_data.append((idx, message))
+                
+                # 显示进度
+                if batch_idx % 10 == 0 or batch_idx == num_batches - 1:
+                    logger.info(f"  当前进度: 有效 {len(valid_indices)}, 无效 {len(problematic_data)}")
+        
+        # 按原始顺序排序
+        valid_indices.sort()
+        self.valid_indices = valid_indices
+        
+        # 输出统计信息
+        logger.info(f"验证完成: 总数据 {len(self.audiopaths_sid_text)}, 有效数据 {len(self.valid_indices)}, 无效数据 {len(problematic_data)}")
+        
+        # 输出问题数据详情（前10条）
+        if problematic_data:
+            logger.warning("前10条问题数据:")
+            for idx, message in problematic_data[:10]:
+                item = self.audiopaths_sid_text[idx]
+                logger.warning(f"  索引 {idx}: {item[0]} - {message}")
+            
+            # 保存问题数据到文件
+            problem_file = os.path.join(os.path.dirname(self.audiopaths_sid_text[0][0]), "problematic_data.txt")
+            with open(problem_file, 'w', encoding='utf-8') as f:
+                for idx, message in problematic_data:
+                    item = self.audiopaths_sid_text[idx]
+                    f.write(f"{idx}|{item[0]}|{message}\n")
+            logger.info(f"问题数据已保存到: {problem_file}")
     
     def __getitem__(self, index):
         # 使用验证后的索引
@@ -86,6 +205,31 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         # 返回有效数据长度
         return len(self.valid_indices)
 
+    def _detailed_validate_problematic(self, problematic_data):
+        """对问题数据进行详细验证"""
+        logger.info("开始详细验证问题数据...")
+        
+        detailed_problematic = []
+        recovered = 0
+        
+        for idx, reason in tqdm(problematic_data, desc="详细验证"):
+            try:
+                audiopath_sid_text = self.audiopaths_sid_text[idx]
+                phones, spec, wav, sid, tone, language, bert, emo = \
+                    self.get_audio_text_speaker_pair(audiopath_sid_text)
+                
+                if bert.shape[-1] == len(phones):
+                    self.valid_indices.append(idx)
+                    recovered += 1
+                else:
+                    detailed_problematic.append((idx, f"长度不匹配: bert={bert.shape[-1]}, phone={len(phones)}"))
+                    
+            except Exception as e:
+                detailed_problematic.append((idx, f"详细验证失败: {str(e)}"))
+        
+        logger.info(f"详细验证完成: 恢复 {recovered} 条数据, 仍有问题 {len(detailed_problematic)} 条")
+        
+    #------------------
     def _filter(self):
         """
         Filter text & store spec lengths
