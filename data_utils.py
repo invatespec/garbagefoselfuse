@@ -70,60 +70,60 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             logger.info(f"数据集较小 ({data_size}条)，使用并行验证模式")
             self._parallel_validate_data()
         
-        def _validate_single_item(self, args):
-            """单条数据验证函数，用于多进程"""
-            idx, audiopath_sid_text, hparams_dict = args
+    def _validate_single_item(self, args):
+        """单条数据验证函数，用于多进程"""
+        idx, audiopath_sid_text, hparams_dict = args
+        
+        try:
+            # 复制hparams设置
+            from copy import deepcopy
+            class SimpleHParams:
+                def __init__(self, d):
+                    for k, v in d.items():
+                        setattr(self, k, v)
             
-            try:
-                # 复制hparams设置
-                from copy import deepcopy
-                class SimpleHParams:
-                    def __init__(self, d):
-                        for k, v in d.items():
-                            setattr(self, k, v)
+            hparams = SimpleHParams(hparams_dict)
+            
+            # 模拟get_text方法
+            audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
+            
+            # 检查基础条件
+            if hparams.min_text_len <= len(phones) and len(phones) <= hparams.max_text_len:
+                phones_list = phones.split(" ")
+                tone_list = [int(i) for i in tone.split(" ")]
+                word2ph_list = [int(i) for i in word2ph.split(" ")]
                 
-                hparams = SimpleHParams(hparams_dict)
+                # 检查BERT文件是否存在
+                bert_path = audiopath.replace(".wav", ".bert.pt")
+                if not os.path.exists(bert_path):
+                    return idx, False, "BERT文件不存在"
                 
-                # 模拟get_text方法
-                audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
+                # 检查音频文件是否存在
+                if not os.path.exists(audiopath):
+                    return idx, False, "音频文件不存在"
                 
-                # 检查基础条件
-                if hparams.min_text_len <= len(phones) and len(phones) <= hparams.max_text_len:
-                    phones_list = phones.split(" ")
-                    tone_list = [int(i) for i in tone.split(" ")]
-                    word2ph_list = [int(i) for i in word2ph.split(" ")]
+                # 加载BERT文件并检查长度
+                try:
+                    bert = torch.load(bert_path, map_location='cpu')
+                    bert_len = bert.shape[-1]
                     
-                    # 检查BERT文件是否存在
-                    bert_path = audiopath.replace(".wav", ".bert.pt")
-                    if not os.path.exists(bert_path):
-                        return idx, False, "BERT文件不存在"
+                    # 计算音素长度（考虑add_blank）
+                    phone_len = len(phones_list)
+                    if hparams.add_blank:
+                        phone_len = phone_len * 2 + 1
                     
-                    # 检查音频文件是否存在
-                    if not os.path.exists(audiopath):
-                        return idx, False, "音频文件不存在"
-                    
-                    # 加载BERT文件并检查长度
-                    try:
-                        bert = torch.load(bert_path, map_location='cpu')
-                        bert_len = bert.shape[-1]
+                    if bert_len == phone_len:
+                        return idx, True, "成功"
+                    else:
+                        return idx, False, f"长度不匹配: bert={bert_len}, phone={phone_len}"
                         
-                        # 计算音素长度（考虑add_blank）
-                        phone_len = len(phones_list)
-                        if hparams.add_blank:
-                            phone_len = phone_len * 2 + 1
-                        
-                        if bert_len == phone_len:
-                            return idx, True, "成功"
-                        else:
-                            return idx, False, f"长度不匹配: bert={bert_len}, phone={phone_len}"
-                            
-                    except Exception as e:
-                        return idx, False, f"加载BERT失败: {str(e)}"
-                else:
-                    return idx, False, f"音素长度超出范围: {len(phones)}"
-                    
-            except Exception as e:
-                return idx, False, f"验证异常: {str(e)}"
+                except Exception as e:
+                    return idx, False, f"加载BERT失败: {str(e)}"
+            else:
+                return idx, False, f"音素长度超出范围: {len(phones)}"
+                
+        except Exception as e:
+            return idx, False, f"验证异常: {str(e)}"
     
     def _parallel_validate_data(self):
         """并行验证所有数据"""
