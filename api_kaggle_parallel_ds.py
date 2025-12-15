@@ -31,13 +31,6 @@ import config as global_config
 import logging
 import subprocess
 
-# 模型实例访问记录，用于LRU淘汰
-model_access_times = {}
-# 当前已加载的模型计数
-loaded_models_count = 0
-# 长文本阈值
-LONG_TEXT_THRESHOLD = long_text 
-
 # ============ GPU环境检测 ============
 import torch
 
@@ -1727,6 +1720,14 @@ def handle(
 # --------------------------------
 # 初始化部分
 # --------------------------------
+
+# 模型实例访问记录，用于LRU淘汰
+model_access_times = {}
+# 当前已加载的模型计数
+loaded_models_count = 0
+# 长文本阈值
+LONG_TEXT_THRESHOLD = long_text 
+
 dict_language = {
     "中文": "all_zh",
     "粤语": "all_yue",
@@ -1986,3 +1987,4 @@ async def tts_endpoint(
 
 if __name__ == "__main__":
     uvicorn.run(app, host=host, port=port, workers=1)
+
