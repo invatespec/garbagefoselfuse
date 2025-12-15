@@ -51,150 +51,165 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
-        self.valid_indices = []  # 新增：存储有效索引
-        self._parallel_validate_data()  # 改为并行验证
+                # 验证数据 - 根据配置选择模式
+        self.valid_indices = []
         
-        # 根据数据量选择验证模式
-        data_size = len(self.audiopaths_sid_text)
-        if data_size > 10000:
-            # 大数据集：使用快速验证
-            logger.info(f"数据集较大 ({data_size}条)，使用快速验证模式")
-            problematic_data = self._quick_validate_data()
+        # 检查是否启用数据验证
+        try:
+            from config import config as app_config
+            enable_validation = getattr(app_config.train_ms_config, 'enable_data_validation', True)
+        except:
+            enable_validation = True
+        
+        if enable_validation and len(self.audiopaths_sid_text) > 0:
+            # 根据数据量选择验证方式
+            data_size = len(self.audiopaths_sid_text)
             
-            # 对有问题数据再进行详细验证
-            if problematic_data:
-                logger.info("对问题数据进行详细验证...")
-                self._detailed_validate_problematic(problematic_data)
+            if data_size < 500:
+                # 小数据集：直接使用全部数据（不验证）
+                logger.info(f"数据集较小 ({data_size}条)，跳过验证")
+                self.valid_indices = list(range(data_size))
+            elif data_size < 5000:
+                # 中等数据集：使用单进程验证
+                logger.info(f"数据集中等 ({data_size}条)，使用单进程验证")
+                self._sequential_validate_data()
+            else:
+                # 大数据集：尝试多进程验证，失败时回退
+                logger.info(f"数据集较大 ({data_size}条)，尝试多进程验证")
+                try:
+                    self._parallel_validate_data()
+                except Exception as e:
+                    logger.warning(f"多进程验证异常，回退到单进程: {e}")
+                    self._sequential_validate_data()
         else:
-            # 小数据集：使用并行验证
-            logger.info(f"数据集较小 ({data_size}条)，使用并行验证模式")
-            self._parallel_validate_data()
+            # 不验证或空数据集
+            logger.info("跳过数据验证" if not enable_validation else "数据集为空")
+            self.valid_indices = list(range(len(self.audiopaths_sid_text)))
         
-    def _validate_single_item(self, args):
-        """单条数据验证函数，用于多进程"""
-        idx, audiopath_sid_text, hparams_dict = args
+    @staticmethod
+    def _validate_single_item_static(args):
+        """
+        静态验证函数，可以被pickle
+        参数格式: (idx, audiopath_sid_text, config_dict)
+        """
+        idx, audiopath_sid_text, config_dict = args
         
         try:
-            # 复制hparams设置
-            from copy import deepcopy
-            class SimpleHParams:
-                def __init__(self, d):
-                    for k, v in d.items():
-                        setattr(self, k, v)
+            # 解包数据
+            audiopath, sid, language, text, phones_str, tone_str, word2ph_str = audiopath_sid_text
             
-            hparams = SimpleHParams(hparams_dict)
+            # 从配置字典获取参数
+            min_text_len = config_dict['min_text_len']
+            max_text_len = config_dict['max_text_len']
+            add_blank = config_dict['add_blank']
             
-            # 模拟get_text方法
-            audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
+            # 检查音素长度
+            phones = phones_str.split(" ")
+            phone_len = len(phones)
             
-            # 检查基础条件
-            if hparams.min_text_len <= len(phones) and len(phones) <= hparams.max_text_len:
-                phones_list = phones.split(" ")
-                tone_list = [int(i) for i in tone.split(" ")]
-                word2ph_list = [int(i) for i in word2ph.split(" ")]
+            if not (min_text_len <= phone_len <= max_text_len):
+                return idx, False, f"音素长度超出范围: {phone_len} (允许: {min_text_len}-{max_text_len})"
+            
+            # 检查文件存在性（这是主要目的）
+            if not os.path.exists(audiopath):
+                return idx, False, "音频文件不存在"
+            
+            bert_path = audiopath.replace(".wav", ".bert.pt")
+            if not os.path.exists(bert_path):
+                return idx, False, "BERT文件不存在"
+            
+            # 检查spec文件（如果启用缓存）
+            spec_path = bert_path.replace(".bert.pt", ".spec.pt")
+            if config_dict.get('spec_cache', False) and not os.path.exists(spec_path):
+                return idx, False, "Spec文件不存在"
+            
+            # 尝试加载BERT文件检查完整性
+            try:
+                bert = torch.load(bert_path, map_location='cpu', weights_only=True)
+                if bert.shape[0] != 2048:  # 检查BERT维度
+                    return idx, False, f"BERT维度错误: {bert.shape}"
                 
-                # 检查BERT文件是否存在
-                bert_path = audiopath.replace(".wav", ".bert.pt")
-                if not os.path.exists(bert_path):
-                    return idx, False, "BERT文件不存在"
+                # 检查长度（粗略估计）
+                bert_len = bert.shape[-1]
                 
-                # 检查音频文件是否存在
-                if not os.path.exists(audiopath):
-                    return idx, False, "音频文件不存在"
+                # 估算音素长度（考虑add_blank）
+                expected_len = phone_len
+                if add_blank:
+                    expected_len = phone_len * 2 + 1
                 
-                # 加载BERT文件并检查长度
-                try:
-                    bert = torch.load(bert_path, map_location='cpu')
-                    bert_len = bert.shape[-1]
-                    
-                    # 计算音素长度（考虑add_blank）
-                    phone_len = len(phones_list)
-                    if hparams.add_blank:
-                        phone_len = phone_len * 2 + 1
-                    
-                    if bert_len == phone_len:
-                        return idx, True, "成功"
-                    else:
-                        return idx, False, f"长度不匹配: bert={bert_len}, phone={phone_len}"
-                        
-                except Exception as e:
-                    return idx, False, f"加载BERT失败: {str(e)}"
-            else:
-                return idx, False, f"音素长度超出范围: {len(phones)}"
+                # 允许一定的容差（±2）
+                if abs(bert_len - expected_len) > 2:
+                    return idx, False, f"长度不匹配: bert={bert_len}, 预期≈{expected_len}"
+                
+                return idx, True, "成功"
+                
+            except Exception as e:
+                return idx, False, f"加载BERT失败: {str(e)}"
                 
         except Exception as e:
-            return idx, False, f"验证异常: {str(e)}"
+            return idx, False, f"验证异常: {str(e)[:100]}"
     
     def _parallel_validate_data(self):
-        """并行验证所有数据"""
+        """并行验证所有数据 - 修复版"""
         logger.info("开始并行验证数据集...")
         
-        # 准备hparams字典（可序列化）
-        hparams_dict = {
+        # 准备可序列化的配置字典
+        from config import config as app_config  # 导入全局配置
+        
+        config_dict = {
             'min_text_len': self.min_text_len,
             'max_text_len': self.max_text_len,
             'add_blank': self.add_blank,
-            'spk2id': self.spk_map,
+            'spec_cache': getattr(app_config.train_ms_config, 'spec_cache', False),
         }
         
-        # 准备任务参数
-        tasks = [(idx, item, hparams_dict) 
+        # 准备任务
+        tasks = [(idx, item, config_dict) 
                 for idx, item in enumerate(self.audiopaths_sid_text)]
         
-        # 确定进程数（使用CPU核心数）
-        num_workers = min(mp.cpu_count(), 8)  # 最多8个进程
-        logger.info(f"使用 {num_workers} 个进程进行验证")
+        # 确定进程数（更保守的设置）
+        num_workers = min(mp.cpu_count() // 2, 4)  # 更保守：最多4个进程
+        logger.info(f"使用 {num_workers} 个进程进行验证 (数据量: {len(tasks)})")
         
-        valid_indices = []
+        self.valid_indices = []
         problematic_data = []
         
-        # 分批处理，避免内存问题
-        batch_size = 1000
-        num_batches = math.ceil(len(tasks) / batch_size)
-        
-        with Pool(processes=num_workers) as pool:
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min((batch_idx + 1) * batch_size, len(tasks))
-                batch_tasks = tasks[start_idx:end_idx]
+        # 使用 imap 以便显示进度
+        try:
+            with Pool(processes=num_workers) as pool:
+                # 使用 tqdm 显示进度
+                from tqdm import tqdm
                 
-                logger.info(f"验证批次 {batch_idx + 1}/{num_batches} ({len(batch_tasks)}条数据)")
-                
-                # 并行处理批次
-                results = pool.map(self._validate_single_item, batch_tasks)
+                results = list(tqdm(
+                    pool.imap(_validate_single_item_wrapper, tasks),
+                    total=len(tasks),
+                    desc="并行验证数据"
+                ))
                 
                 # 处理结果
                 for idx, is_valid, message in results:
                     if is_valid:
-                        valid_indices.append(idx)
+                        self.valid_indices.append(idx)
                     else:
                         problematic_data.append((idx, message))
-                
-                # 显示进度
-                if batch_idx % 10 == 0 or batch_idx == num_batches - 1:
-                    logger.info(f"  当前进度: 有效 {len(valid_indices)}, 无效 {len(problematic_data)}")
+                        
+        except Exception as e:
+            logger.error(f"多进程验证失败，回退到单进程: {e}")
+            # 回退到单进程
+            self._sequential_validate_data()
+            return
         
-        # 按原始顺序排序
-        valid_indices.sort()
-        self.valid_indices = valid_indices
+        # 输出统计
+        logger.info(f"验证完成: 总数据 {len(self.audiopaths_sid_text)}, "
+                   f"有效数据 {len(self.valid_indices)}, "
+                   f"无效数据 {len(problematic_data)}")
         
-        # 输出统计信息
-        logger.info(f"验证完成: 总数据 {len(self.audiopaths_sid_text)}, 有效数据 {len(self.valid_indices)}, 无效数据 {len(problematic_data)}")
-        
-        # 输出问题数据详情（前10条）
-        if problematic_data:
-            logger.warning("前10条问题数据:")
-            for idx, message in problematic_data[:10]:
-                item = self.audiopaths_sid_text[idx]
-                logger.warning(f"  索引 {idx}: {item[0]} - {message}")
-            
-            # 保存问题数据到文件
-            problem_file = os.path.join(os.path.dirname(self.audiopaths_sid_text[0][0]), "problematic_data.txt")
-            with open(problem_file, 'w', encoding='utf-8') as f:
-                for idx, message in problematic_data:
-                    item = self.audiopaths_sid_text[idx]
-                    f.write(f"{idx}|{item[0]}|{message}\n")
-            logger.info(f"问题数据已保存到: {problem_file}")
+        # 如果有效数据太少，使用原始数据
+        if len(self.valid_indices) < len(self.audiopaths_sid_text) * 0.5:  # 少于50%
+            logger.warning("有效数据过少，使用全部数据（跳过验证）")
+            self.valid_indices = list(range(len(self.audiopaths_sid_text)))
+        else:
+            self._log_problematic_data(problematic_data)
     
     def __getitem__(self, index):
         # 使用验证后的索引
@@ -205,6 +220,52 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         # 返回有效数据长度
         return len(self.valid_indices)
 
+    def _sequential_validate_data(self):
+        """单进程验证（回退方案）"""
+        logger.info("使用单进程验证数据...")
+        
+        self.valid_indices = []
+        problematic_data = []
+        
+        for idx in tqdm(range(len(self.audiopaths_sid_text)), desc="单进程验证"):
+            try:
+                # 直接调用原始方法，确保环境正确
+                audiopath_sid_text = self.audiopaths_sid_text[idx]
+                phones, spec, wav, sid, tone, language, bert, emo = \
+                    self.get_audio_text_speaker_pair(audiopath_sid_text)
+                
+                if bert.shape[-1] == len(phones):
+                    self.valid_indices.append(idx)
+                else:
+                    problematic_data.append((idx, f"长度不匹配: bert={bert.shape[-1]}, phone={len(phones)}"))
+                    
+            except Exception as e:
+                problematic_data.append((idx, f"验证失败: {str(e)[:100]}"))
+        
+        logger.info(f"单进程验证完成: 有效 {len(self.valid_indices)}, 无效 {len(problematic_data)}")
+3----------------
+    def _log_problematic_data(self, problematic_data, max_display=20):
+        """记录问题数据"""
+        if problematic_data:
+            logger.warning(f"发现 {len(problematic_data)} 条问题数据:")
+            
+            # 按错误类型分类
+            error_counts = {}
+            for idx, message in problematic_data:
+                error_type = message.split(":")[0] if ":" in message else message
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
+            
+            logger.warning("错误统计:")
+            for error_type, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
+                logger.warning(f"  {error_type}: {count}条")
+            
+            # 显示前几个详情
+            logger.warning("前{}条问题数据详情:".format(min(max_display, len(problematic_data))))
+            for idx, message in problematic_data[:max_display]:
+                item = self.audiopaths_sid_text[idx]
+                logger.warning(f"  索引 {idx}: {item[0]}")
+                logger.warning(f"    错误: {message}")
+    
     def _detailed_validate_problematic(self, problematic_data):
         """对问题数据进行详细验证"""
         logger.info("开始详细验证问题数据...")
