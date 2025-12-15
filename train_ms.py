@@ -416,10 +416,23 @@ def train_and_evaluate(
     logger,
     writers,
 ):
+    # 创建rank安全的logger
+    def safe_log(level, msg):
+        if rank == 0 and logger is not None:
+            if level == "info":
+                logger.info(msg)
+            elif level == "warning":
+                logger.warning(msg)
+            elif level == "error":
+                logger.error(msg)
+        elif rank != 0:
+            # 非rank0进程使用简单打印
+            print(f"[Rank {rank}] {msg}")
     net_g, net_d, net_dur_disc, net_wd, wl = nets
     optim_g, optim_d, optim_dur_disc, optim_wd = optims
     scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd = schedulers
     train_loader, eval_loader = loaders
+    
     if writers is not None:
         writer, writer_eval = writers
 
@@ -445,16 +458,19 @@ def train_and_evaluate(
         bert,
         emo,
     ) in enumerate(tqdm(train_loader)):
-    # 添加batch数据验证
+    # 添加batch数据验证（rank安全版本）
         try:
-            # 验证batch内所有数据的一致性
             batch_size = x.size(0)
+            needs_fix = False
+            
             for i in range(batch_size):
                 bert_len = bert[i].shape[-1]
-                x_len = x_lengths[i]
+                x_len = x_lengths[i].item()  # 使用item()获取标量值
                 
                 if bert_len != x_len:
-                    logger.warning(f"Batch {batch_idx} 样本 {i} 长度不一致: bert_len={bert_len}, x_len={x_len}")
+                    safe_log("warning", f"Batch {batch_idx} 样本 {i} 长度不一致: bert_len={bert_len}, x_len={x_len}")
+                    needs_fix = True
+                    
                     # 动态调整：使用最小长度
                     min_len = min(bert_len, x_len)
                     if min_len > 0:
@@ -463,8 +479,19 @@ def train_and_evaluate(
                         x_lengths[i] = min_len
                     else:
                         raise ValueError(f"无效的长度: bert_len={bert_len}, x_len={x_len}")
+            
+            # 如果进行了调整，重新检查整个batch
+            if needs_fix:
+                # 重新计算最大长度
+                max_bert_len = max([b.shape[-1] for b in bert])
+                max_x_len = max([x_len.item() for x_len in x_lengths])
+                
+                if max_bert_len != max_x_len:
+                    safe_log("error", f"Batch {batch_idx} 调整后仍不一致，跳过该batch")
+                    continue
+                    
         except Exception as e:
-            logger.error(f"Batch {batch_idx} 数据验证失败: {e}")
+            safe_log("error", f"Batch {batch_idx} 数据验证失败: {e}")
             continue  # 跳过这个batch
         
         if net_g.module.use_noise_scaled_mas:
