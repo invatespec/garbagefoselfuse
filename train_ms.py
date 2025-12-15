@@ -445,6 +445,28 @@ def train_and_evaluate(
         bert,
         emo,
     ) in enumerate(tqdm(train_loader)):
+    # 添加batch数据验证
+        try:
+            # 验证batch内所有数据的一致性
+            batch_size = x.size(0)
+            for i in range(batch_size):
+                bert_len = bert[i].shape[-1]
+                x_len = x_lengths[i]
+                
+                if bert_len != x_len:
+                    logger.warning(f"Batch {batch_idx} 样本 {i} 长度不一致: bert_len={bert_len}, x_len={x_len}")
+                    # 动态调整：使用最小长度
+                    min_len = min(bert_len, x_len)
+                    if min_len > 0:
+                        bert[i] = bert[i][:, :min_len]
+                        x[i] = x[i][:min_len]
+                        x_lengths[i] = min_len
+                    else:
+                        raise ValueError(f"无效的长度: bert_len={bert_len}, x_len={x_len}")
+        except Exception as e:
+            logger.error(f"Batch {batch_idx} 数据验证失败: {e}")
+            continue  # 跳过这个batch
+        
         if net_g.module.use_noise_scaled_mas:
             current_mas_noise_scale = (
                 net_g.module.mas_noise_scale_initial
