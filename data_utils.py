@@ -243,7 +243,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 problematic_data.append((idx, f"验证失败: {str(e)[:100]}"))
         
         logger.info(f"单进程验证完成: 有效 {len(self.valid_indices)}, 无效 {len(problematic_data)}")
-3----------------
+
     def _log_problematic_data(self, problematic_data, max_display=20):
         """记录问题数据"""
         if problematic_data:
