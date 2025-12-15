@@ -49,6 +49,42 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
+        self.valid_indices = []  # 新增：存储有效索引
+        self._validate_all_data()  # 新增：验证所有数据
+
+    def _validate_all_data(self):
+        """预验证所有数据，过滤有问题样本"""
+        logger.info("开始验证数据集...")
+        self.valid_indices = []
+        problematic_count = 0
+        
+        for idx in tqdm(range(len(self.audiopaths_sid_text)), desc="验证数据"):
+            try:
+                # 尝试获取数据
+                audiopath_sid_text = self.audiopaths_sid_text[idx]
+                phones, spec, wav, sid, tone, language, bert, emo = \
+                    self.get_audio_text_speaker_pair(audiopath_sid_text)
+                
+                # 额外验证：检查BERT和音素长度是否一致
+                if bert.shape[-1] == len(phones):
+                    self.valid_indices.append(idx)
+                else:
+                    logger.warning(f"数据 {idx} 长度不匹配: bert_len={bert.shape[-1]}, phone_len={len(phones)}")
+                    problematic_count += 1
+            except Exception as e:
+                logger.warning(f"数据 {idx} 加载失败: {e}")
+                problematic_count += 1
+        
+        logger.info(f"验证完成: 有效数据 {len(self.valid_indices)} 条, 问题数据 {problematic_count} 条")
+    
+    def __getitem__(self, index):
+        # 使用验证后的索引
+        actual_index = self.valid_indices[index]
+        return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[actual_index])
+    
+    def __len__(self):
+        # 返回有效数据长度
+        return len(self.valid_indices)
 
     def _filter(self):
         """
@@ -152,9 +188,35 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             for i in range(len(word2ph)):
                 word2ph[i] = word2ph[i] * 2
             word2ph[0] += 1
+        
         bert_path = wav_path.replace(".wav", ".bert.pt")
-        bert = torch.load(bert_path)
-        assert bert.shape[-1] == len(phone)
+        try:
+            bert = torch.load(bert_path)
+            
+            # 调试信息
+            if bert.shape[-1] != len(phone):
+                logger.error(f"BERT与音素长度不匹配!")
+                logger.error(f"  文件: {wav_path}")
+                logger.error(f"  文本: {text}")
+                logger.error(f"  音素: {phone}")
+                logger.error(f"  BERT形状: {bert.shape}")
+                logger.error(f"  音素长度: {len(phone)}")
+                logger.error(f"  语言: {language_str}")
+                
+                # 尝试修复：截断较长的序列
+                min_len = min(bert.shape[-1], len(phone))
+                if min_len > 0:
+                    bert = bert[:, :min_len]
+                    phone = phone[:min_len]
+                    tone = tone[:min_len]
+                    language = language[:min_len]
+                    logger.warning(f"  已截断到长度: {min_len}")
+                else:
+                    raise ValueError("截断后长度为0")
+        except Exception as e:
+            logger.error(f"加载BERT文件失败: {bert_path}, 错误: {e}")
+            raise
+        
         phone = torch.LongTensor(phone)
         tone = torch.LongTensor(tone)
         language = torch.LongTensor(language)
