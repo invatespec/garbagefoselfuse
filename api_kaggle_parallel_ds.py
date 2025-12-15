@@ -31,6 +31,39 @@ import config as global_config
 import logging
 import subprocess
 
+import logging.config
+import uvicorn
+
+logging.config.dictConfig(uvicorn.config.LOGGING_CONFIG)
+logger = logging.getLogger("uvicorn")
+
+# 模型实例访问记录，用于LRU淘汰
+model_access_times = {}
+# 当前已加载的模型计数
+loaded_models_count = 0
+# 长文本阈值
+long_text_threshold = 70 
+
+# ============ GPU环境检测 ============
+def check_gpu_availability():
+    """检测可用的GPU数量"""
+    gpu_count = torch.cuda.device_count()
+    logger.info(f"✅ 检测到 {gpu_count} 个GPU设备")
+    
+    if gpu_count == 0:
+        logger.warning("❌ 未检测到GPU，将使用CPU模式")
+        return 0, ["cpu"]
+    elif gpu_count == 1:
+        logger.info("🔧 单GPU环境，启用单卡优化模式")
+        return 1, ["cuda:0"]
+    else:
+        logger.info(f"🚀 多GPU环境，启用并行模式")
+        return gpu_count, [f"cuda:{i}" for i in range(gpu_count)]
+
+# 检测GPU
+GPU_COUNT, GPU_LIST = check_gpu_availability()
+IS_MULTI_GPU = GPU_COUNT > 1
+
 class DefaultRefer:
     def __init__(self, path, text, language):
         self.path = args.default_refer_path
@@ -1695,37 +1728,10 @@ def handle(
         media_type="audio/" + media_type,
     )
 
-# ============ GPU环境检测 ============
-def check_gpu_availability():
-    """检测可用的GPU数量"""
-    gpu_count = torch.cuda.device_count()
-    logger.info(f"✅ 检测到 {gpu_count} 个GPU设备")
-    
-    if gpu_count == 0:
-        logger.warning("❌ 未检测到GPU，将使用CPU模式")
-        return 0, ["cpu"]
-    elif gpu_count == 1:
-        logger.info("🔧 单GPU环境，启用单卡优化模式")
-        return 1, ["cuda:0"]
-    else:
-        logger.info(f"🚀 多GPU环境，启用并行模式")
-        return gpu_count, [f"cuda:{i}" for i in range(gpu_count)]
-
 
 # --------------------------------
 # 初始化部分
 # --------------------------------
-
-# 检测GPU
-GPU_COUNT, GPU_LIST = check_gpu_availability()
-IS_MULTI_GPU = GPU_COUNT > 1
-
-# 模型实例访问记录，用于LRU淘汰
-model_access_times = {}
-# 当前已加载的模型计数
-loaded_models_count = 0
-# 长文本阈值
-long_text_threshold = 70 
 
 dict_language = {
     "中文": "all_zh",
@@ -1986,5 +1992,6 @@ async def tts_endpoint(
 
 if __name__ == "__main__":
     uvicorn.run(app, host=host, port=port, workers=1)
+
 
 
