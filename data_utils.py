@@ -324,40 +324,27 @@ class TextAudioSpeakerCollate:
 
 
 class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
-    """
-    Maintain similar input lengths in a batch.
-    Length groups are specified by boundaries.
-    Ex) boundaries = [b1, b2, b3] -> any batch is included either {x | b1 < length(x) <=b2} or {x | b2 < length(x) <= b3}.
-
-    It removes samples which are not included in the boundaries.
-    Ex) boundaries = [b1, b2, b3] -> any x s.t. length(x) <= b1 or length(x) > b3 are discarded.
-    """
-
-    def __init__(
-        self,
-        dataset,
-        batch_size,
-        boundaries,
-        num_replicas=None,
-        rank=None,
-        shuffle=True,
-    ):
+    def __init__(self, dataset, batch_size, boundaries, num_replicas=None, rank=None, shuffle=True):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
-        self.lengths = dataset.lengths
+        
+        # 使用数据集的有效长度
+        self.lengths = [dataset.lengths[i] for i in dataset.valid_indices]
+        self.valid_indices = dataset.valid_indices  # 存储有效索引
         self.batch_size = batch_size
         self.boundaries = boundaries
-
+        
         self.buckets, self.num_samples_per_bucket = self._create_buckets()
         self.total_size = sum(self.num_samples_per_bucket)
         self.num_samples = self.total_size // self.num_replicas
-
+    
     def _create_buckets(self):
         buckets = [[] for _ in range(len(self.boundaries) - 1)]
-        for i in range(len(self.lengths)):
-            length = self.lengths[i]
+        for i, length in enumerate(self.lengths):
             idx_bucket = self._bisect(length)
             if idx_bucket != -1:
-                buckets[idx_bucket].append(i)
+                buckets[idx_bucket].append(self.valid_indices[i])  # 使用原始索引
+        
+        # ... 其余代码保持不变 ...
 
         try:
             for i in range(len(buckets) - 1, 0, -1):
