@@ -252,25 +252,24 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         phone_len = len(phone)
         
         if bert_len != phone_len:
-        # 使用最小长度
-        min_len = min(bert_len, phone_len)
-        if min_len > 0:
-            bert = bert[:, :min_len]
-            phone = phone[:min_len]
-            tone = tone[:min_len]
-            language = language[:min_len]
-        else:
-            # 如果长度都为0，创建空数据
-            bert = torch.zeros((1024, 1)) if bert_len == 0 else bert
-            phone = [0] if phone_len == 0 else phone
-            tone = [0] if phone_len == 0 else tone
-            language = [0] if phone_len == 0 else language
+            # 使用最小长度
+            min_len = min(bert_len, phone_len)
+            if min_len > 0:
+                bert = bert[:, :min_len]
+                phone = phone[:min_len]
+                tone = tone[:min_len]
+                language = language[:min_len]
+            else:
+                # 如果长度都为0，创建空数据
+                bert = torch.zeros((1024, 1)) if bert_len == 0 else bert
+                phone = [0] if phone_len == 0 else phone
+                tone = [0] if phone_len == 0 else tone
+                language = [0] if phone_len == 0 else language
     
-    phone = torch.LongTensor(phone)
-    tone = torch.LongTensor(tone)
-    language = torch.LongTensor(language)
-    
-    return bert, phone, tone, language
+        phone = torch.LongTensor(phone)
+        tone = torch.LongTensor(tone)
+        language = torch.LongTensor(language)
+        return bert, phone, tone, language
         try:
             bert = torch.load(bert_path)
             
