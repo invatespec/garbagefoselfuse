@@ -36,7 +36,7 @@ model_access_times = {}
 # 当前已加载的模型计数
 loaded_models_count = 0
 # 长文本阈值
-LONG_TEXT_THRESHOLD = 70
+LONG_TEXT_THRESHOLD = long_text 
 
 # --- 从这里开始，复制 gradio_tunneling 的核心代码 (放在文件顶部的 import 区域) ---
 import atexit
@@ -205,6 +205,29 @@ def setup_tunnel(
     except Exception as e:
         raise RuntimeError(str(e)) from e
 # --- 复制到此结束 ---
+
+
+# ============ GPU环境检测 ============
+import torch
+
+def check_gpu_availability():
+    """检测可用的GPU数量"""
+    gpu_count = torch.cuda.device_count()
+    logger.info(f"✅ 检测到 {gpu_count} 个GPU设备")
+    
+    if gpu_count == 0:
+        logger.warning("❌ 未检测到GPU，将使用CPU模式")
+        return 0, ["cpu"]
+    elif gpu_count == 1:
+        logger.info("🔧 单GPU环境，启用单卡优化模式")
+        return 1, ["cuda:0"]
+    else:
+        logger.info(f"🚀 多GPU环境，启用并行模式")
+        return gpu_count, [f"cuda:{i}" for i in range(gpu_count)]
+
+# 检测GPU
+GPU_COUNT, GPU_LIST = check_gpu_availability()
+IS_MULTI_GPU = GPU_COUNT > 1
 
 class DefaultRefer:
     def __init__(self, path, text, language):
@@ -908,7 +931,7 @@ def unload_least_recently_used():
 def ensure_model_loaded(speaker_id, gpu_index=None):
     """
     确保指定说话人的模型加载到指定的GPU上
-    gpu_index: 0或1，为None时自动选择
+    自动适配单GPU环境
     """
     from time import time as ttime
     
@@ -923,6 +946,20 @@ def ensure_model_loaded(speaker_id, gpu_index=None):
     
     # 更新全局访问记录（用于LRU淘汰）
     model_access_times[speaker_id] = ttime()
+
+    # 单GPU环境：只使用GPU 0
+    if not IS_MULTI_GPU:
+        gpu_index = 0
+        target_gpu = "cuda:0"
+        
+        if speaker.gpu0_gpt is None:
+            if loaded_models_count >= max_models:
+                unload_least_recently_used()
+            
+            speaker.gpu0_gpt = get_gpt_weights(speaker.gpt_path, target_gpu)
+            speaker.gpu0_sovits = get_sovits_weights(speaker.sovits_path, target_gpu)
+            loaded_models_count += 1
+        return
     
     # 如果指定了GPU索引
     if gpu_index is not None:
@@ -1011,9 +1048,15 @@ def get_tts_wav(
     import asyncio
     import concurrent.futures
     import numpy as np
-    
-    # 1. 智能文本拆分
-    is_long, text_segments = split_long_text(text, LONG_TEXT_THRESHOLD)
+
+    # 根据GPU环境决定是否启用并行
+    if IS_MULTI_GPU:
+        is_long, text_segments = split_long_text(text, LONG_TEXT_THRESHOLD)
+    else:
+        # 单GPU环境：长文本也使用单卡处理
+        is_long = False
+        text_segments = [text]
+        logger.info("🔧 单GPU环境，禁用并行处理")
     
     # 更新模型访问时间
     if spk in speaker_list:
@@ -1030,26 +1073,24 @@ def get_tts_wav(
         # ============ 长文本并行处理 ============
         logger.info(f"📖 长文本检测 ({len(text)}字 > {LONG_TEXT_THRESHOLD})，启用双GPU并行处理")
         
-        # 2.1 确保两个GPU上都有模型
+        # 3.1 确保两个GPU上都有模型
         ensure_model_loaded(spk, 0)
         ensure_model_loaded(spk, 1)
         
-        # 2.2 使用优化的并行处理器
-        processor = ParallelProcessor(max_workers=2)
-        
-        try:
-            # 准备任务
+        # 3.2 并行处理两个文本片段
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # 准备两个任务
             futures = []
             for i, segment in enumerate(text_segments):
-                if not segment.strip():
+                if not segment.strip():  # 跳过空片段
                     continue
                     
-                target_gpu = i % 2
+                target_gpu = i % 2  # 0或1
                 logger.info(f"  GPU{target_gpu} 处理片段 {i+1}: {segment[:30]}...")
                 
-                # 提交任务（使用同一个 _process_single_segment 函数）
-                future = processor.submit_task(
-                    _process_single_segment,  # 直接使用优化后的函数
+                # 提交任务到线程池
+                future = executor.submit(
+                    _process_single_segment,
                     text_segment=segment,
                     refer_wav_path=refer_wav_path,
                     prompt_text=prompt_text,
@@ -1067,43 +1108,19 @@ def get_tts_wav(
                 )
                 futures.append((i, future))
             
-            # 收集结果
+            # 3.3 收集结果并保持顺序
             segment_results = []
             for seg_idx, future in sorted(futures, key=lambda x: x[0]):
                 try:
-                    audio_data, sr = future.result(timeout=180)  # 3分钟超时
+                    # 获取音频数据：audio_array, sample_rate
+                    audio_data, sr = future.result(timeout=120)  # 120秒超时
                     segment_results.append((seg_idx, audio_data, sr))
-                    
+                except concurrent.futures.TimeoutError:
+                    logger.error(f"❌ 片段 {seg_idx} 处理超时")
+                    raise
                 except Exception as e:
                     logger.error(f"❌ 片段 {seg_idx} 处理失败: {e}")
-                    # 如果某个片段失败，尝试在另一个GPU上重试
-                    logger.info(f"尝试在备用GPU上重试片段 {seg_idx}")
-                    try:
-                        # 在另一个GPU上重试
-                        alt_gpu = 1 if seg_idx % 2 == 0 else 0
-                        audio_data, sr = _process_single_segment(
-                            text_segment=text_segments[seg_idx],
-                            refer_wav_path=refer_wav_path,
-                            prompt_text=prompt_text,
-                            prompt_language=prompt_language,
-                            text_language=text_language,
-                            top_k=top_k,
-                            top_p=top_p,
-                            temperature=temperature,
-                            speed=speed,
-                            inp_refs=inp_refs,
-                            sample_steps=sample_steps,
-                            if_sr=if_sr,
-                            spk=spk,
-                            gpu_index=alt_gpu
-                        )
-                        segment_results.append((seg_idx, audio_data, sr))
-                        logger.info(f"✅ 片段 {seg_idx} 在备用GPU{alt_gpu}上重试成功")
-                    except Exception as retry_e:
-                        logger.error(f"❌ 片段 {seg_idx} 重试也失败: {retry_e}")
-                        raise
-        finally:
-            processor.shutdown()
+                    raise
         
         # 3.4 合并音频片段
         if not segment_results:
@@ -1203,8 +1220,6 @@ def get_tts_wav(
         # 一次性返回
         yield audio_bytes.getvalue()
 
-python
-# 1. 直接在 _process_single_segment 函数中添加缓存和优化
 def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_language,
                            text_language, top_k, top_p, temperature, speed,
                            inp_refs, sample_steps, if_sr, spk, gpu_index):
@@ -1212,27 +1227,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
     处理单个文本片段（内部函数，用于并行处理）
     返回: (audio_data, sampling_rate)
     """
-    from time import time as ttime
-    
-    # 生成缓存键（添加gpu_index确保不同GPU的结果分开缓存）
-    cache_key = f"{spk}_gpu{gpu_index}_{hash(text_segment[:100])}_{top_k}_{top_p}_{temperature}_{speed}_{sample_steps}"
-    
-    # 检查缓存
-    cached_result = _get_from_cache(cache_key)
-    if cached_result is not None:
-        logger.info(f"GPU{gpu_index} 使用缓存结果: {text_segment[:30]}...")
-        return cached_result
-    
     try:
-        # 处理前检查GPU内存
-        free_mem, _ = check_gpu_memory(gpu_index)
-        if free_mem < 0.5:  # 少于500MB
-            logger.warning(f"GPU{gpu_index} 内存紧张 ({free_mem:.2f}GB)，清理缓存...")
-            torch.cuda.empty_cache()
-        
-        start_time = ttime()
-        
-        # 原有的处理逻辑开始...
         global bigvgan_model, hifigan_model, sv_cn_model
         
         # 1. 获取目标GPU
@@ -1293,7 +1288,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
         zero_wav = np.zeros(int(hps.data.sampling_rate * 0.3), dtype=np.float16 if is_half == True else np.float32)
         zero_wav_torch = torch.from_numpy(zero_wav)
         
-        # 7. 参考音频处理（使用优化的SSL处理）
+        # 7. 参考音频处理（与原始函数相同，但指定目标GPU）
         with torch.no_grad():
             wav16k, sr = librosa.load(refer_wav_path, sr=16000)
             wav16k = torch.from_numpy(wav16k)
@@ -1307,8 +1302,26 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
             
             wav16k = torch.cat([wav16k, zero_wav_torch])
             
-            # 使用优化的SSL处理
-            ssl_content = _get_ssl_content(wav16k, target_gpu)
+            # SSL模型处理
+            ssl_device = None
+            try:
+                if hasattr(ssl_model, 'parameters'):
+                    ssl_device = next(ssl_model.parameters()).device
+                elif hasattr(ssl_model, 'device'):
+                    ssl_device = ssl_model.device
+            except Exception as e:
+                ssl_device = torch.device("cpu")
+            
+            if ssl_device.type != "cpu":
+                wav16k_for_ssl = wav16k.to(ssl_device)
+                ssl_content = ssl_model.model(wav16k_for_ssl.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
+                ssl_content = ssl_content.to(target_gpu)
+            else:
+                wav16k_cpu = wav16k.cpu()
+                ssl_content = ssl_model.model(wav16k_cpu.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
+                if is_half == True:
+                    ssl_content = ssl_content.half()
+                ssl_content = ssl_content.to(target_gpu)
             
             codes = vq_model.extract_latent(ssl_content)
             prompt_semantic = codes[0, 0]
@@ -1339,7 +1352,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
             else:
                 refer, audio_tensor = get_spepc_for_gpu(hps, refer_wav_path, dtype, target_gpu)
         
-        # 8. 文本处理
+        # 8. 文本处理（与原始函数相同，但指定目标GPU）
         texts = text_segment.split("\n")
         audio_opt = []  # 存储所有音频片段
         
@@ -1361,7 +1374,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
             all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(target_gpu).unsqueeze(0)
             all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(target_gpu)
             
-            # 9. GPT推理
+            # 9. GPT推理（与原始函数相同，但指定目标GPU）
             with torch.no_grad():
                 pred_semantic, idx = t2s_model.model.infer_panel(
                     all_phoneme_ids,
@@ -1531,17 +1544,7 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
                 if max_audio > 1.0:
                     combined_audio = combined_audio / max_audio
                 sr = 48000
-            
-            # 验证音频输出
             combined_audio = _validate_audio_output(combined_audio, sr)
-            
-            # 缓存结果
-            elapsed = ttime() - start_time
-            logger.info(f"GPU{gpu_index} 处理完成: {elapsed:.2f}s, 音频长度: {len(combined_audio)/sr:.2f}s")
-            
-            # 添加到缓存
-            _add_to_cache(cache_key, (combined_audio, sr))
-            
             return combined_audio, sr
         else:
             # 如果没有生成音频，返回静音
@@ -1550,9 +1553,6 @@ def _process_single_segment(text_segment, refer_wav_path, prompt_text, prompt_la
             
     except Exception as e:
         logger.error(f"❌ GPU{gpu_index} 处理失败: {e}")
-        # 清理可能的部分缓存
-        if cache_key in _audio_cache.cache:
-            _audio_cache.remove(cache_key)
         raise
 
 def get_spepc_for_gpu(hps, filename, dtype, target_gpu, is_v2pro=False):
@@ -1791,6 +1791,11 @@ def split_long_text(text, threshold=LONG_TEXT_THRESHOLD):
     - is_long: 是否为长文本
     - segments: 文本片段列表，长文本时为2段，短文本时为1段
     """
+    # 单GPU环境不进行并行拆分
+    if not IS_MULTI_GPU:
+        return False, [text]
+        
+    # 多GPU环境拆分 
     if len(text) <= threshold:
         return False, [text]
     
@@ -1887,41 +1892,6 @@ def handle(
         ),
         media_type="audio/" + media_type,
     )
-class ParallelProcessor:
-    """并行处理器，优化GPU利用率"""
-    
-    def __init__(self, max_workers=2):
-        self.max_workers = min(max_workers, 2)  # 最多2个GPU
-        self.executor = None
-        self._init_executor()
-    
-    def _init_executor(self):
-        """初始化线程池"""
-        from concurrent.futures import ThreadPoolExecutor
-        
-        # 使用有界队列防止内存溢出
-        import queue
-        max_queue_size = 10
-        
-        self.executor = ThreadPoolExecutor(
-            max_workers=self.max_workers,
-            thread_name_prefix="GPU_Worker",
-        )
-    
-    def submit_task(self, func, *args, **kwargs):
-        """提交任务到线程池"""
-        if self.executor is None:
-            self._init_executor()
-        
-        return self.executor.submit(func, *args, **kwargs)
-    
-    def shutdown(self):
-        """关闭线程池"""
-        if self.executor:
-            self.executor.shutdown(wait=True)
-    
-    def __del__(self):
-        self.shutdown()
 
 # --------------------------------
 # 初始化部分
@@ -1985,9 +1955,7 @@ parser.add_argument("-cp", "--cut_punc", type=str, default="", help="文本切�
 parser.add_argument("-hb", "--hubert_path", type=str, default=g_config.cnhubert_path, help="覆盖config.cnhubert_path")
 parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, help="覆盖config.bert_path")
 parser.add_argument("-mm", "--max_models", type=int, default=3, help="最大同时加载模型数量")
-# 添加下面这行来支持自定义子域名
-parser.add_argument("--sd", "--subdomain", type=str, default=None, help="指定隧道使用的固定子域名 (例如: your-name)")
-
+parser.add_argument("-lt", "--long_text", type=int, default=70, help="长文本界限")
 args = parser.parse_args()
 sovits_path = args.sovits_path
 gpt_path = args.gpt_path
@@ -1998,6 +1966,7 @@ cnhubert_base_path = args.hubert_path
 bert_path = args.bert_path
 default_cut_punc = args.cut_punc
 max_models = args.max_models
+long_text = args.long_text
 
 # 应用参数配置
 default_refer = DefaultRefer(args.default_refer_path, args.default_refer_text, args.default_refer_language)
@@ -2248,3 +2217,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         print("\n👋 接收到中断信号，正在关闭...")
+
+    
