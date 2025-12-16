@@ -178,6 +178,13 @@ class InferenceScheduler:
             self._idx = (self._idx + 1) % len(self.gpu_ids)
             return gpu_id
 
+#描述模型实例
+@dataclass(frozen=True)
+class ModelSpec:
+    gpt_path: str
+    sovits_path: str
+
+
 class ModelBoundRuntime:
     def __init__(
         self,
@@ -208,12 +215,6 @@ class ModelBoundRuntime:
                     self._runtimes[gpu_id] = self._build_runtime(gpu_id)
 
         return self._runtimes[gpu_id]
-
-#描述模型实例
-@dataclass(frozen=True)
-class ModelSpec:
-    gpt_path: str
-    sovits_path: str
 
 class SpeakerRuntime:
     def __init__(
