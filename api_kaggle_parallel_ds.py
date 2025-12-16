@@ -2182,8 +2182,6 @@ if __name__ == "__main__":
         print("="*60)
         
         try:
-            # 从config获取端口
-            port = config.server_config.port
             # 使用指定子域名或生成随机令牌
             share_token = args.sd if args.sd else secrets.token_urlsafe(32)
             
@@ -2242,4 +2240,5 @@ if __name__ == "__main__":
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n👋 接收到中断信号，正在关闭服务...")
+
 
