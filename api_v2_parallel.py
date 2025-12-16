@@ -298,7 +298,7 @@ class SpeakerManager:
                         model_runtime=model_runtime,
                     )
         return self._speakers[key]
-        
+
     def cleanup_expired_models(self):
         with self._lock:
             expired_specs = [
@@ -310,6 +310,14 @@ class SpeakerManager:
                 runtime = self._model_runtimes.pop(spec)
                 runtime.cleanup()
 
+def detect_gpus() -> list[int]:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return [0]
+        return list(range(torch.cuda.device_count()))
+    except Exception:
+        return [0]
 
 gpu_ids = detect_gpus()
 scheduler = InferenceScheduler(gpu_ids)
