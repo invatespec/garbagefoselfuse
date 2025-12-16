@@ -147,8 +147,7 @@ if config_path in [None, ""]:
 tts_config = TTS_Config(config_path)
 print(tts_config)
 
-gpu_count = torch.cuda.device_count()
-gpu_ids = list(range(gpu_count)) if gpu_count > 0 else [0]
+gpu_ids = detect_gpus()
 
 scheduler = InferenceScheduler(gpu_ids)
 
@@ -455,6 +454,14 @@ def check_params(req: dict):
 
     return None
 
+def detect_gpus() -> list[int]:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return [0]
+        return list(range(torch.cuda.device_count()))
+    except Exception:
+        return [0]
 
 async def tts_handle(req: dict):
     """
