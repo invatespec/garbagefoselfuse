@@ -147,16 +147,6 @@ if config_path in [None, ""]:
 tts_config = TTS_Config(config_path)
 print(tts_config)
 
-gpu_ids = detect_gpus()
-
-scheduler = InferenceScheduler(gpu_ids)
-
-speaker_manager = SpeakerManager(
-    base_config=tts_config,
-    scheduler=scheduler,
-)
-
-
 class TTSRuntime:
     def __init__(self, tts_config: TTS_Config):
         self.tts_config = tts_config
@@ -260,6 +250,22 @@ class SpeakerManager:
                 scheduler=self.scheduler,
             )
         return self._model_runtimes[model_spec]
+
+def detect_gpus() -> list[int]:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return [0]
+        return list(range(torch.cuda.device_count()))
+    except Exception:
+        return [0]
+
+gpu_ids = detect_gpus()
+scheduler = InferenceScheduler(gpu_ids)
+speaker_manager = SpeakerManager(
+    base_config=tts_config,
+    scheduler=scheduler,
+)
 
 APP = FastAPI()
 
@@ -453,15 +459,6 @@ def check_params(req: dict):
         )
 
     return None
-
-def detect_gpus() -> list[int]:
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return [0]
-        return list(range(torch.cuda.device_count()))
-    except Exception:
-        return [0]
 
 async def tts_handle(req: dict):
     """
