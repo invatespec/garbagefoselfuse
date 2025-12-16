@@ -179,10 +179,15 @@ class InferenceScheduler:
             return gpu_id
 
 #描述模型实例
+from dataclasses import dataclass
 @dataclass(frozen=True)
 class ModelSpec:
-    gpt_path: str
-    sovits_path: str
+    profile: str    # "custom" | "v1" | "v2"
+    t2s_weights_path: str
+    vits_weights_path: str
+
+
+import time
 
 class ModelBoundRuntime:
     def __init__(
@@ -190,30 +195,56 @@ class ModelBoundRuntime:
         model_spec: ModelSpec,
         base_config: TTS_Config,
         scheduler: InferenceScheduler,
+        ttl_seconds: int = 600,   # 默认 10 分钟
     ):
         self.model_spec = model_spec
         self.base_config = base_config
         self.scheduler = scheduler
+        self.ttl_seconds = ttl_seconds
 
-        self._runtimes = {}  # gpu_id -> TTSRuntime
+        self._runtimes = {}      # gpu_id -> TTSRuntime
+        self._last_used = time.time()
         self._lock = threading.Lock()
 
     def _build_runtime(self, gpu_id: int) -> TTSRuntime:
         cfg = copy.deepcopy(self.base_config)
-        cfg.gpt_path = self.model_spec.gpt_path
-        cfg.sovits_path = self.model_spec.sovits_path
-        cfg.device = f"cuda:{gpu_id}"
+
+        if not hasattr(cfg, self.model_spec.profile):
+            raise ValueError(f"Invalid profile: {self.model_spec.profile}")
+
+        profile_cfg = getattr(cfg, self.model_spec.profile)
+
+        # === 注入权重 ===
+        profile_cfg.t2s_weights_path = self.model_spec.t2s_weights_path
+        profile_cfg.vits_weights_path = self.model_spec.vits_weights_path
+
+        # === 注入 device（官方字段）===
+        profile_cfg.device = f"cuda:{gpu_id}"
+
         return TTSRuntime(cfg)
 
     def get(self) -> TTSRuntime:
+        self._last_used = time.time()
         gpu_id = self.scheduler.acquire()
-
         if gpu_id not in self._runtimes:
             with self._lock:
                 if gpu_id not in self._runtimes:
                     self._runtimes[gpu_id] = self._build_runtime(gpu_id)
 
         return self._runtimes[gpu_id]
+
+    def expired(self) -> bool:
+        return (time.time() - self._last_used) > self.ttl_seconds
+
+    def cleanup(self):
+        with self._lock:
+            for gpu_id, runtime in self._runtimes.items():
+                try:
+                    # 释放模型引用，交给 PyTorch 回收
+                    del runtime
+                except Exception:
+                    pass
+        self._runtimes.clear()
 
 class SpeakerRuntime:
     def __init__(
@@ -237,12 +268,12 @@ class SpeakerManager:
     ):
         self.base_config = base_config
         self.scheduler = scheduler
-        self._model_runtimes = {}
-        self._speakers = {}
+
+        self._model_runtimes = {}   # ModelSpec -> ModelBoundRuntime
+        self._speakers = {}         # (speaker_id, ModelSpec) -> SpeakerRuntime
         self._lock = threading.Lock()
 
-
-    def _get_model_runtime(self, model_spec):
+    def _get_model_runtime(self, model_spec: ModelSpec) -> ModelBoundRuntime:
         if model_spec not in self._model_runtimes:
             self._model_runtimes[model_spec] = ModelBoundRuntime(
                 model_spec=model_spec,
@@ -251,14 +282,34 @@ class SpeakerManager:
             )
         return self._model_runtimes[model_spec]
 
-def detect_gpus() -> list[int]:
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return [0]
-        return list(range(torch.cuda.device_count()))
-    except Exception:
-        return [0]
+    def get(
+        self,
+        speaker_id: str,
+        model_spec: ModelSpec,
+    ) -> "SpeakerRuntime":
+        key = (speaker_id, model_spec)
+
+        if key not in self._speakers:
+            with self._lock:
+                if key not in self._speakers:
+                    model_runtime = self._get_model_runtime(model_spec)
+                    self._speakers[key] = SpeakerRuntime(
+                        speaker_id=speaker_id,
+                        model_runtime=model_runtime,
+                    )
+        return self._speakers[key]
+        
+    def cleanup_expired_models(self):
+        with self._lock:
+            expired_specs = [
+                spec for spec, runtime in self._model_runtimes.items()
+                if runtime.expired()
+            ]
+
+            for spec in expired_specs:
+                runtime = self._model_runtimes.pop(spec)
+                runtime.cleanup()
+
 
 gpu_ids = detect_gpus()
 scheduler = InferenceScheduler(gpu_ids)
@@ -494,22 +545,41 @@ async def tts_handle(req: dict):
     returns:
         StreamingResponse: audio stream response.
     """
-    speaker_id = req.get("speaker", "default")
+    
+    profile = req.get("profile", "custom")
+    profile_cfg = getattr(tts_config, profile)
 
-    gpt_path = req.get("gpt_path", tts_config.gpt_path)
-    sovits_path = req.get("sovits_path", tts_config.sovits_path)
+    t2s_path = req.get(
+        "t2s_weights_path",
+        profile_cfg.t2s_weights_path,
+    )
+    vits_path = req.get(
+        "vits_weights_path",
+        profile_cfg.vits_weights_path,
+    )
+
+    speaker_id = req.get("speaker", "default")
+    profile = req.get("profile", "custom")
+
+    if not hasattr(tts_config, profile):
+        raise HTTPException(400, f"Unknown profile: {profile}")
+
+    profile_cfg = getattr(tts_config, profile)
 
     model_spec = ModelSpec(
-        gpt_path=gpt_path,
-        sovits_path=sovits_path,
+        profile=profile,
+        t2s_weights_path=req.get(
+            "t2s_weights_path",
+            profile_cfg.t2s_weights_path,
+        ),
+        vits_weights_path=req.get(
+            "vits_weights_path",
+            profile_cfg.vits_weights_path,
+        ),
     )
 
     speaker = speaker_manager.get(speaker_id, model_spec)
     tts_generator = speaker.run(req)
-
-    streaming_mode = req.get("streaming_mode", False)
-    return_fragment = req.get("return_fragment", False)
-    media_type = req.get("media_type", "wav")
 
     check_res = check_params(req)
     if check_res is not None:
